@@ -1,0 +1,91 @@
+{
+  "version": "1",
+  "metadata": {
+    "marimo_version": "0.23.15",
+    "script_metadata_hash": null
+  },
+  "cells": [
+    {
+      "id": "Hbol",
+      "code_hash": "d1ec41387cff9600b7e350d941163145",
+      "outputs": [
+        {
+          "type": "data",
+          "data": {
+            "text/plain": ""
+          }
+        }
+      ],
+      "console": []
+    },
+    {
+      "id": "iUuy",
+      "code_hash": "6b8e054cbe54b1012e2a216b403a984e",
+      "outputs": [
+        {
+          "type": "data",
+          "data": {
+            "text/markdown": "<span class=\"markdown prose dark:prose-invert contents\"><h1 id=\"config-parameters\">Config Parameters</h1></span>"
+          }
+        }
+      ],
+      "console": []
+    },
+    {
+      "id": "MLBZ",
+      "code_hash": null,
+      "outputs": [],
+      "console": []
+    },
+    {
+      "id": "eOOI",
+      "code_hash": "196be2a335bc25ad498a1fe5dc4b261a",
+      "outputs": [
+        {
+          "type": "data",
+          "data": {
+            "text/markdown": "<span class=\"markdown prose dark:prose-invert contents\"><h1 id=\"recurrent-spiking-neural-network\">Recurrent Spiking Neural Network</h1></span>"
+          }
+        }
+      ],
+      "console": []
+    },
+    {
+      "id": "ZUdt",
+      "code_hash": null,
+      "outputs": [],
+      "console": []
+    },
+    {
+      "id": "FoZW",
+      "code_hash": "23486846f484b54666b6246951402171",
+      "outputs": [
+        {
+          "type": "data",
+          "data": {
+            "text/markdown": "<span class=\"markdown prose dark:prose-invert contents\"><h1 id=\"ghost\">Ghost</h1></span>"
+          }
+        }
+      ],
+      "console": []
+    },
+    {
+      "id": "MJUe",
+      "code_hash": "8bb59eea83876d9195791a30fa1ac1d3",
+      "outputs": [],
+      "console": []
+    },
+    {
+      "id": "pCfa",
+      "code_hash": null,
+      "outputs": [],
+      "console": []
+    },
+    {
+      "id": "oBvh",
+      "code_hash": null,
+      "outputs": [],
+      "console": []
+    }
+  ]
+}
