@@ -620,10 +620,18 @@ class Actor(nn.Module):
 
 
 class Predictor(nn.Module):
+
     def __init__(self, cfg: Config) -> None:
         super().__init__(); self.cfg = cfg
+
+
+        #Strategy Encoder
         self.strategy_encoder = mlp(
-            cfg.strategy_dim+2, cfg.hidden_dim, cfg.conditioning_dim)
+            cfg.strategy_dim + 1,
+            cfg.hidden_dim,
+            cfg.conditioning_dim,
+        )
+
         self.core = RecurrentSNN(
             cfg.latent_dim+cfg.conditioning_dim+ACTION_DIM,
             cfg.hidden_dim, cfg, persistent=True,
@@ -635,12 +643,26 @@ class Predictor(nn.Module):
             cfg.latent_dim,
         )
 
-    def forward(self, latent: torch.Tensor, strategy: torch.Tensor,
-                desirability: torch.Tensor, outcome_logvar: torch.Tensor,
-                action: torch.Tensor):
-        strategy_context = torch.cat((strategy, desirability[:, None],
-                                      outcome_logvar[:, None]), -1)
-        conditioning = self.strategy_encoder(strategy_context)
+    def forward(
+            self,
+            latent: torch.Tensor,
+            strategy: torch.Tensor,
+            desirability: torch.Tensor,
+            action: torch.Tensor,
+        ):
+
+        strategy_context = torch.cat(
+            (
+                strategy,
+                desirability[:, None],
+            ),
+            dim=-1,
+        )
+
+        conditioning = self.strategy_encoder(
+            strategy_context
+        )
+
         action_code = F.one_hot(action, ACTION_DIM).float()
         feature = self.norm(self.core(torch.cat(
             (latent, conditioning, action_code), -1)))
@@ -2317,24 +2339,25 @@ def predictor_update(
         latent: torch.Tensor,
         strategy: torch.Tensor,
         desirability: torch.Tensor,
-        outcome_logvar: torch.Tensor,
         action: torch.Tensor,
         next_latent: torch.Tensor,
         valid: torch.Tensor,
         reward: torch.Tensor,
         train_encoder: bool = False,
-        sigreg_state: torch.Tensor | None = None):
+        sigreg_state: torch.Tensor | None = None,
+    ):
+        
     predictor_latent = (
         latent.detach()
         if system.cfg.detach_predictor_from_encoder
         else latent
     )
 
+    #Predictor Call
     predicted_next_latent = system.predictor(
         predictor_latent,
         strategy.detach(),
         desirability.detach(),
-        outcome_logvar.detach(),
         action,
     )
 
@@ -2961,7 +2984,6 @@ def run_condition(cfg: Config, condition: str, seed: int,
                 latent,
                 actor_strategy,
                 actor_desirability,
-                actor_outcome_logvar,
                 actor["action"],
                 target_next_latent,
                 valid_prediction,
@@ -2997,7 +3019,6 @@ def run_condition(cfg: Config, condition: str, seed: int,
                 latent,
                 actor_strategy,
                 actor_desirability,
-                actor_outcome_logvar,
                 actor["action"],
                 next_latent,
                 valid_prediction,
@@ -3496,6 +3517,7 @@ def evaluate(system: System, cfg: Config, seed: int, intervention: str):
     system.strategy_memory.zero_(); system.desirability_memory.zero_()
     system.outcome_logvar_memory.zero_()
     episodes = successes = wrong = 0
+
     while episodes < cfg.evaluation_episodes:
         observation = torch.tensor(env.observation(), device=system.device)
         latent, _, _ = system.encoder(observation)
@@ -3555,7 +3577,6 @@ def evaluate(system: System, cfg: Config, seed: int, intervention: str):
             latent,
             actor_strategy,
             actor_desirability,
-            actor_outcome_logvar,
             actor["action"],
         )
 
