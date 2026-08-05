@@ -97,11 +97,18 @@ class Config:
     jepa_variance_weight: float = 0.10
 
     #SIGReg
-    sigreg_weight: float = 0.2
+    sigreg_weight: float = 0.0
     sigreg_projections: int = 128
     sigreg_frequency_samples: int = 8
     sigreg_max_frequency: float = 5.0
     sigreg_trace_decay: float = 0.99
+
+    # Strategy SIGReg
+    strategy_sigreg_weight: float = 0.0
+    strategy_sigreg_projections: int = 128
+    strategy_sigreg_frequency_samples: int = 8
+    strategy_sigreg_max_frequency: float = 5.0
+    strategy_sigreg_trace_decay: float = 0.99
 
     use_reward_adaln: bool = True
     reward_adaln_strength: float = 0.25
@@ -539,6 +546,7 @@ class Strategizer(nn.Module):
     def forward(self, latent: torch.Tensor, feedback: torch.Tensor,
                 deterministic: bool = False,
                 previous_strategy: torch.Tensor | None = None):
+        
         conditioning = self.feedback_encoder(feedback)
         if self.cfg.learned_strategy_memory:
             if previous_strategy is None:
@@ -550,7 +558,12 @@ class Strategizer(nn.Module):
         else:
             core_input = torch.cat((latent, conditioning), -1)
         feature = self.norm(self.core(core_input))
-        proposal = torch.tanh(self.strategy_head(feature))
+
+
+        proposal_pre_tanh = self.strategy_head(feature)
+        proposal = torch.tanh(proposal_pre_tanh)
+
+
         if self.gate_head is not None:
             gate = torch.sigmoid(self.gate_head(feature))
             strategy = ((1-gate)*previous_strategy+gate*proposal)
@@ -564,10 +577,16 @@ class Strategizer(nn.Module):
             (feature.detach(), strategy.detach()), -1))
         desirability = outcome[:, 0]
         outcome_logvar = outcome[:, 1].clamp(-5.0, 2.0)
-        return {"feature": feature, "proposal": proposal, "gate": gate,
-                "strategy": strategy, "previous_strategy": previous_strategy,
-                "desirability": desirability,
-                "outcome_logvar": outcome_logvar}
+        return {
+            "feature": feature,
+            "proposal_pre_tanh": proposal_pre_tanh,
+            "proposal": proposal,
+            "gate": gate,
+            "strategy": strategy,
+            "previous_strategy": previous_strategy,
+            "desirability": desirability,
+            "outcome_logvar": outcome_logvar,
+        }
 
     def snapshot(self):
         return self.core.snapshot()
@@ -1312,21 +1331,65 @@ class RecurrentStrategyEprop:
         return float(torch.stack([trace.square().sum()
                                   for trace in self.reward_traces]).sum().sqrt())
 
-    def apply(self, td_error: torch.Tensor) -> Tuple[float, float]:
+    def apply(
+            self,
+            td_error: torch.Tensor,
+            minimizing_gradients: Sequence[torch.Tensor | None] | None = None,
+        ) -> Tuple[float, float]:
+
         self.optimizer.zero_grad(set_to_none=True)
-        direction_square = torch.zeros((), device=td_error.device)
-        for parameter, trace in zip(self.parameters, self.reward_traces):
-            view = (td_error.shape[0],)+(1,)*(trace.ndim-1)
-            direction = (trace*td_error.view(view)).mean(0)
-            parameter.grad = direction
-            direction_square += direction.square().sum()
-        before = [parameter.detach().clone() for parameter in self.parameters]
+
+        task_direction_square = torch.zeros(
+            (),
+            device=td_error.device,
+        )
+
+        for index, (parameter, trace) in enumerate(
+            zip(self.parameters, self.reward_traces)
+        ):
+            view = (
+                td_error.shape[0],
+            ) + (1,) * (trace.ndim - 1)
+
+            # Reward-e-prop is a direction that should be maximized.
+            task_direction = (
+                trace * td_error.view(view)
+            ).mean(dim=0)
+
+            combined_direction = task_direction
+
+            # SIGReg is a loss that should be minimized. Because this
+            # optimizer uses maximize=True, subtract its gradient.
+            if minimizing_gradients is not None:
+                regularization_gradient = minimizing_gradients[index]
+
+                if regularization_gradient is not None:
+                    combined_direction = (
+                        combined_direction
+                        - regularization_gradient
+                    )
+
+            parameter.grad = combined_direction
+
+            # Preserve the existing task-gradient diagnostic.
+            task_direction_square += task_direction.square().sum()
+
+        before = [
+            parameter.detach().clone()
+            for parameter in self.parameters
+        ]
+
         self.optimizer.step()
+
         step_square = torch.stack([
-            (parameter-old).square().sum()
-            for parameter, old in zip(self.parameters, before)]).sum()
-        return (float(direction_square.sqrt().detach()),
-                float(step_square.sqrt().detach()))
+            (parameter - old).square().sum()
+            for parameter, old in zip(self.parameters, before)
+        ]).sum()
+
+        return (
+            float(task_direction_square.sqrt().detach()),
+            float(step_square.sqrt().detach()),
+        )
 
     def reset(self, mask: torch.Tensor) -> None:
         if not bool(mask.any()):
@@ -2055,7 +2118,7 @@ class System:
         
         self.predictor = Predictor(cfg).to(device)
 
-        #Continuous SIGReg
+        #Continuous SIGReg on the encoder latent
         self.sigreg = (
             ContinuousSIGReg(
                 dimension=cfg.latent_dim,
@@ -2066,6 +2129,23 @@ class System:
                 seed=30_000 + seed,
             )
             if self.use_jepa and cfg.sigreg_weight > 0.0
+            else None
+        )
+        
+        #Continuous SIGReg on the strategy latent
+        self.strategy_sigreg = (
+            ContinuousSIGReg(
+                dimension=cfg.strategy_dim,
+                projections=cfg.strategy_sigreg_projections,
+                frequency_samples=cfg.strategy_sigreg_frequency_samples,
+                max_frequency=cfg.strategy_sigreg_max_frequency,
+                trace_decay=cfg.strategy_sigreg_trace_decay,
+                seed=40_000 + seed,
+            )
+            if (
+                condition == "separated"
+                and cfg.strategy_sigreg_weight > 0.0
+            )
             else None
         )
 
@@ -2920,6 +3000,54 @@ def run_condition(cfg: Config, condition: str, seed: int,
             )            
         else:
             strategy_trace = 0.0
+            strategy_encoder_trace = 0.0
+
+        strategy_sigreg_loss = 0.0
+        strategy_sigreg_gradient = 0.0
+        strategy_sigreg_gradients = None
+
+        if system.strategy_sigreg is not None:
+            strategy_sigreg_objective = system.strategy_sigreg.loss(
+                strategy["proposal_pre_tanh"]
+            )
+
+            weighted_strategy_sigreg = (
+                cfg.strategy_sigreg_weight
+                * strategy_sigreg_objective
+            )
+
+            raw_strategy_sigreg_gradients = torch.autograd.grad(
+                weighted_strategy_sigreg,
+                system.strategy_parameters,
+                retain_graph=True,
+                allow_unused=True,
+            )
+
+            strategy_sigreg_gradients = [
+                (
+                    gradient.detach()
+                    if gradient is not None
+                    else None
+                )
+                for gradient in raw_strategy_sigreg_gradients
+            ]
+
+            gradient_square = torch.zeros(
+                (),
+                device=device,
+            )
+
+            for gradient in strategy_sigreg_gradients:
+                if gradient is not None:
+                    gradient_square += gradient.square().sum()
+
+            strategy_sigreg_loss = float(
+                strategy_sigreg_objective.detach()
+            )
+
+            strategy_sigreg_gradient = float(
+                gradient_square.sqrt()
+            )
 
         with torch.no_grad():
             permutation = torch.roll(torch.arange(
@@ -3077,7 +3205,10 @@ def run_condition(cfg: Config, condition: str, seed: int,
         system.update_target_encoder()
         system.update_target_representation_critic()
         if condition != "actor_only":
-            strategy_direction, strategy_step = system.strategy_eprop.apply(td)
+            strategy_direction, strategy_step = system.strategy_eprop.apply(
+                td,
+                minimizing_gradients=strategy_sigreg_gradients,
+            )
         else:
             strategy_direction = strategy_step = 0.0
         target = reward+cfg.gamma*(~done).float()*next_value.detach()
@@ -3162,6 +3293,9 @@ def run_condition(cfg: Config, condition: str, seed: int,
             ("predictor_eprop_gradient", predictor_eprop_gradient),
             ("predictor_encoder_eligibility", predictor_encoder_eligibility),
             ("predictor_encoder_eprop_gradient", predictor_encoder_eprop_gradient),
+
+            ("strategy_sigreg_loss", strategy_sigreg_loss),
+            ("strategy_sigreg_gradient", strategy_sigreg_gradient),
 
             ("strategy_encoder_trace", strategy_encoder_trace),
             ("strategy_encoder_memory",
@@ -3370,6 +3504,15 @@ def run_condition(cfg: Config, condition: str, seed: int,
                     sums["strategy_encoder_step"]
                     / decisions
                 ),
+
+                "strategy_sigreg_loss": (
+                    sums["strategy_sigreg_loss"] / decisions
+                ),
+
+                "strategy_sigreg_gradient": (
+                    sums["strategy_sigreg_gradient"] / decisions
+                ),
+
                 "shuffle_tv": sums["shuffle_tv"]/decisions,
                 "zero_tv": sums["zero_tv"]/decisions,
                 "strategy_stability": (
