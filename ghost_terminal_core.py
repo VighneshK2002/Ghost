@@ -94,7 +94,7 @@ class Config:
     encoder_lr: float = 3e-4
     encoder_eprop_lr: float = 3e-5
     encoder_target_tau: float = 0.005
-    jepa_variance_weight: float = 0.10
+    jepa_variance_weight: float = 0.0
 
     #SIGReg
     sigreg_weight: float = 0.0
