@@ -1,0 +1,28 @@
+{
+  "experiment": "delayed_cue_tmaze",
+  "source": "ghost/ghost_terminal_core.py (byte-identical move from deccc33)",
+  "git_commit": "deccc33",
+  "verified_at": "2026-08-29",
+  "python": "3.13.1",
+  "torch": "2.13.0",
+  "device": "cpu",
+  "checkpoint": null,
+  "smoke_configuration": {
+    "seed": 11,
+    "worlds": 2,
+    "training_transitions": 8,
+    "evaluation_episodes_minimum": 4
+  },
+  "smoke_training": {
+    "episodes": 2,
+    "successes": 0,
+    "success_rate": 0.0,
+    "wrong_rate": 0.0,
+    "timeout_rate": 1.0
+  },
+  "smoke_evaluation": {
+    "success_rate": 0.0,
+    "wrong_rate": 0.0,
+    "note": "Execution baseline only; an eight-transition run is not a scientific result."
+  }
+}

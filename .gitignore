@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+
+# Environments and editors
+.venv/
+venv/
+env/
+.DS_Store
+.idea/
+.vscode/
+
+# Generated notebook state and local outputs
+__marimo__/session/
+*.log
+artifacts/
+results/delayed_cue_tmaze/latest_run.json
+
+# Model artifacts are published separately after compatibility review.
+*.pt
+*.pth
+*.ckpt
+
+# Keep intentionally published figures and tabular evidence.
+!results/**/*.png
+!results/**/*.svg
+!results/**/*.csv

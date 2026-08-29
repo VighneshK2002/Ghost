@@ -1,0 +1,11 @@
+{
+  "condition": "separated",
+  "seed": 11,
+  "seeds": 1,
+  "worlds": 24,
+  "transitions": 65536,
+  "evaluation_episodes_minimum": 192,
+  "cue_steps": 2,
+  "episode_limit": 48,
+  "exploration_rate": 0.1
+}

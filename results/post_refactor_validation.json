@@ -1,0 +1,32 @@
+{
+  "experiment": "delayed_cue_tmaze",
+  "verified_at": "2026-08-29",
+  "python": "3.13.1",
+  "torch": "2.13.0",
+  "device": "cpu",
+  "configuration": {
+    "seed": 11,
+    "worlds": 2,
+    "training_transitions": 8,
+    "evaluation_episodes_minimum": 4,
+    "curriculum_min_episodes_per_cue": 1,
+    "curriculum_history_per_cue": 2,
+    "curriculum_episode_limits": [4, 6, 8, 10]
+  },
+  "training": {
+    "episodes": 2,
+    "successes": 0,
+    "success_rate": 0.0,
+    "wrong_rate": 0.0,
+    "timeout_rate": 1.0
+  },
+  "evaluation": {
+    "success_rate": 0.0,
+    "wrong_rate": 0.0
+  },
+  "comparison_to_pre_refactor": "exact match on recorded smoke metrics",
+  "checkpoint_validation": {
+    "new_checkpoint_round_trip": "passed",
+    "historical_v8_strict_load": "rejected as incompatible"
+  }
+}

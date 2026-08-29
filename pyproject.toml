@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ghost-continual-learning"
+version = "0.1.0"
+description = "Experimental continual-learning spiking architecture with persistent memory"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "License not yet selected; see LICENSE-TODO.md"}
+dependencies = [
+  "numpy>=1.26",
+  "torch>=2.2",
+]
+
+[project.optional-dependencies]
+dev = ["matplotlib>=3.8", "pytest>=8"]
+notebook = ["anywidget>=0.9", "marimo>=0.23", "traitlets>=5"]
+
+[tool.setuptools.packages.find]
+include = ["ghost*", "environments*", "experiments*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
