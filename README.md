@@ -29,8 +29,9 @@ six-seed reproduction.
 The saved session used three-decimal reporting and did not save the six model
 states. The historical three-seed checkpoint is tensor-incompatible with the
 committed source, so these numbers are **historical verified output, not yet a
-checkpoint-reproducible release result**. See
-[`RESULTS_TO_REPRODUCE.md`](RESULTS_TO_REPRODUCE.md) for the exact gap.
+checkpoint-reproducible release result**. The six trained states were not
+saved, and the historical checkpoint is incompatible with the current source;
+exact checkpoint reproduction therefore remains future work.
 
 ![Saved six-seed evaluation evidence](results/delayed_cue_tmaze/figures/seed_results.png)
 
@@ -172,8 +173,6 @@ research motivation, not a demonstrated capability claim.
   mechanisms with hardware-appropriate alternatives;
 - evaluate eventual implementations on neuromorphic hardware.
 
-## Release status
+This repository is research software, not a production agent framework.
 
-This repository is research software, not a production agent framework. A
-license must be selected before release; see [`LICENSE-TODO.md`](LICENSE-TODO.md)
-and [`PUBLIC_RELEASE_CHECKLIST.md`](PUBLIC_RELEASE_CHECKLIST.md).
+Licensed under Apache License 2.0.
