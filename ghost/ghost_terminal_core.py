@@ -106,6 +106,7 @@ class Config:
     predictor_trace_decay: float = 0.995
     strategy_retention: float = 0.95
     learned_strategy_memory: bool = True
+    persist_recurrent_state_across_episodes: bool = False
     td_clip: float = 3.0
     encoder_lr: float = 3e-4
     encoder_eprop_lr: float = 3e-5
@@ -156,6 +157,7 @@ class Config:
     curriculum_min_episodes_per_cue: int = 32
     curriculum_history_per_cue: int = 64
     curriculum_episode_limits: Tuple[int, ...] = (16, 24, 36, 48)
+    cue_probability_schedule: Tuple[Tuple[int, float], ...] = ()
     encoder_learning_mode: str = "cue_auxiliary"
     cue_aux_weight: float = 2.0
     exploration_rate: float = 0.10
@@ -211,6 +213,17 @@ class BatchedTMaze:
         self.curriculum_history = (
             deque(maxlen=cfg.curriculum_history_per_cue),
             deque(maxlen=cfg.curriculum_history_per_cue))
+        self.cue_probability_schedule = tuple(
+            (int(transition), float(probability))
+            for transition, probability in cfg.cue_probability_schedule
+        )
+        self._validate_cue_probability_schedule()
+        self.completed_transitions = 0
+        self.cue_assignment_counts = np.zeros(2, np.int64)
+        self.cue_assignment_probability_sum = 0.0
+        self._cue_schedule_index = -1
+        self._scheduled_assignments = 0
+        self._scheduled_left_assignments = 0
         b = cfg.worlds
         self.x = np.zeros(b, np.int64)
         self.y = np.zeros(b, np.int64)
@@ -221,6 +234,55 @@ class BatchedTMaze:
         self.episode = np.zeros(b, np.int64)
         self.reset(np.ones(b, bool))
 
+    def _validate_cue_probability_schedule(self) -> None:
+        schedule = self.cue_probability_schedule
+        if not schedule:
+            return
+        if schedule[0][0] != 0:
+            raise ValueError("cue probability schedule must start at transition 0")
+        previous_transition = -1
+        for transition, probability in schedule:
+            if transition <= previous_transition:
+                raise ValueError(
+                    "cue probability schedule transitions must be strictly increasing"
+                )
+            if not 0.0 <= probability <= 1.0:
+                raise ValueError("cue probability must be in [0, 1]")
+            previous_transition = transition
+
+    def _scheduled_cues(self, count: int) -> np.ndarray:
+        schedule_index = max(
+            index
+            for index, (transition, _) in enumerate(self.cue_probability_schedule)
+            if transition <= self.completed_transitions
+        )
+        probability_left = self.cue_probability_schedule[schedule_index][1]
+        if schedule_index != self._cue_schedule_index:
+            self._cue_schedule_index = schedule_index
+            self._scheduled_assignments = 0
+            self._scheduled_left_assignments = 0
+
+        new_total = self._scheduled_assignments + count
+        target_left = int(np.floor(new_total * probability_left + 0.5))
+        left_count = target_left - self._scheduled_left_assignments
+        cues = np.ones(count, np.int64)
+        cues[:left_count] = 0
+        self.rng.shuffle(cues)
+        self._scheduled_assignments = new_total
+        self._scheduled_left_assignments = target_left
+        return cues
+
+    @property
+    def current_cue_probability_left(self) -> float:
+        if not self.curriculum_enabled or not self.cue_probability_schedule:
+            return 0.5
+        probability = self.cue_probability_schedule[0][1]
+        for transition, candidate in self.cue_probability_schedule:
+            if transition > self.completed_transitions:
+                break
+            probability = candidate
+        return probability
+
     def reset(self, mask: np.ndarray) -> None:
         count = int(mask.sum())
         if not count:
@@ -228,7 +290,16 @@ class BatchedTMaze:
         self.x[mask] = self.center
         self.y[mask] = self.start_rows[self.curriculum_stage]
         self.direction[mask] = 0
-        self.cue[mask] = self.rng.integers(0, 2, count)
+        if self.curriculum_enabled and self.cue_probability_schedule:
+            assignment_probability_left = self.current_cue_probability_left
+            assigned_cues = self._scheduled_cues(count)
+        else:
+            # Preserve the historical RNG path when no schedule is requested.
+            assignment_probability_left = 0.5
+            assigned_cues = self.rng.integers(0, 2, count)
+        self.cue[mask] = assigned_cues
+        self.cue_assignment_counts += np.bincount(assigned_cues, minlength=2)
+        self.cue_assignment_probability_sum += count * assignment_probability_left
         self.age[mask] = 0
         self.previous_action[mask] = 2
         self.episode[mask] += 1
@@ -312,6 +383,7 @@ class BatchedTMaze:
                 self.curriculum_stage += 1
                 for history in self.curriculum_history:
                     history.clear()
+        self.completed_transitions += self.cfg.worlds
         self.reset(done)
         return self.observation(), rewards, done, successes, wrong, cue, terminal_age
 
@@ -2287,8 +2359,18 @@ class System:
             target.mul_(1-tau).add_(online, alpha=tau)
 
     def reset(self, mask: torch.Tensor) -> None:
-        self.strategizer.reset(mask); self.predictor.reset(mask)
-        self.actor.reset(mask)
+        if not self.cfg.persist_recurrent_state_across_episodes:
+            self.strategizer.reset(mask); self.predictor.reset(mask)
+            self.actor.reset(mask)
+
+            self.feedback[mask] = 0
+            self.strategy_memory[mask] = 0
+            self.desirability_memory[mask] = 0
+            self.outcome_logvar_memory[mask] = 0
+
+        # Eligibility remains episode-scoped even when recurrent activity is
+        # persistent, preventing rewards in a later episode from assigning
+        # credit to actions taken in an earlier episode.
         self.actor_eprop.reset(mask); self.strategy_eprop.reset(mask)
 
         if self.predictor_eprop is not None:
@@ -2302,11 +2384,6 @@ class System:
 
         if self.strategy_encoder_eprop is not None:
             self.strategy_encoder_eprop.reset(mask)
-
-        self.feedback[mask] = 0
-        self.strategy_memory[mask] = 0
-        self.desirability_memory[mask] = 0
-        self.outcome_logvar_memory[mask] = 0
 
     def strategy_and_action(self, latent: torch.Tensor,
                             deterministic: bool = False):
@@ -2904,6 +2981,8 @@ def run_condition(cfg: Config, condition: str, seed: int,
     previous_strategy = torch.zeros(
         cfg.worlds, cfg.strategy_dim, device=device)
     reward_context = torch.zeros(cfg.worlds, device=device)
+    reported_cue_assignments = np.zeros(2, np.int64)
+    reported_cue_probability_sum = 0.0
 
     def add(name: str, value: float) -> None:
         sums[name] = sums.get(name, 0.0)+value
@@ -3421,6 +3500,17 @@ def run_condition(cfg: Config, condition: str, seed: int,
             )
 
             curriculum_rates = env.curriculum_rates
+            cue_assignments = env.cue_assignment_counts - reported_cue_assignments
+            cue_assignment_count = int(cue_assignments.sum())
+            cue_probability_sum = (
+                env.cue_assignment_probability_sum
+                - reported_cue_probability_sum
+            )
+            window_cue_probability_left = (
+                cue_probability_sum / cue_assignment_count
+                if cue_assignment_count
+                else env.current_cue_probability_left
+            )
             progress = {
                 "condition": condition,
                 "seed": seed,
@@ -3430,6 +3520,11 @@ def run_condition(cfg: Config, condition: str, seed: int,
                 "successes": successes,
                 "curriculum_stage": env.curriculum_stage+1,
                 "curriculum_stages": len(env.start_rows),
+                "cue_assignments_left": int(cue_assignments[0]),
+                "cue_assignments_right": int(cue_assignments[1]),
+                "cue_probability_left": window_cue_probability_left,
+                "cue_probability_left_current": (
+                    env.current_cue_probability_left),
                 "window_success": (
                     window_successes/max(window_episodes, 1)),
                 "window_wrong": window_wrong/max(window_episodes, 1),
@@ -3551,6 +3646,9 @@ def run_condition(cfg: Config, condition: str, seed: int,
                 f"stage_limit={env.episode_limits[env.curriculum_stage]} "
                 f"cue_success=[{curriculum_rates[0]:.2f},"
                 f"{curriculum_rates[1]:.2f}] "
+                f"cue_assignments=[{cue_assignments[0]},"
+                f"{cue_assignments[1]}] "
+                f"cue_p_left={window_cue_probability_left:.3f} "
                 f"window_rate={window_successes/max(window_episodes,1):.3f} "
                 f"wrong_rate={window_wrong/max(window_episodes,1):.3f} "
                 f"timeout_rate={window_timeouts/max(window_episodes,1):.3f} "
@@ -3641,6 +3739,8 @@ def run_condition(cfg: Config, condition: str, seed: int,
                 f"strategy:{sums['strategy_step']/decisions:.5f}]")
             window_steps = window_episodes = window_successes = window_wrong = 0
             window_timeouts = 0
+            reported_cue_assignments = env.cue_assignment_counts.copy()
+            reported_cue_probability_sum = env.cue_assignment_probability_sum
             sums.clear()
             strategy_values.clear()
             encoder_values.clear()
@@ -3749,13 +3849,20 @@ def evaluate(system: System, cfg: Config, seed: int, intervention: str):
             - predicted_next_latent
         )
 
-        system.feedback = torch.cat(
+        predictor_feedback = torch.cat(
             (
                 predicted_change,
                 prediction_error,
             ),
             dim=-1,
         )
+        if intervention == "predictor_shuffle":
+            permutation = torch.roll(torch.arange(
+                cfg.worlds, device=system.device), 1)
+            predictor_feedback = predictor_feedback[permutation]
+        elif intervention == "predictor_zero":
+            predictor_feedback = torch.zeros_like(predictor_feedback)
+        system.feedback = predictor_feedback
 
 
         done = torch.tensor(done_np, device=system.device)

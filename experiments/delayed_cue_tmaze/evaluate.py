@@ -25,7 +25,15 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--episodes", type=int, default=192)
     result.add_argument("--device", default="cpu", choices=("cpu", "mps", "cuda"))
     result.add_argument(
-        "--intervention", choices=("real", "shuffle", "zero"), default="real"
+        "--intervention",
+        choices=(
+            "real",
+            "shuffle",
+            "zero",
+            "predictor_shuffle",
+            "predictor_zero",
+        ),
+        default="real",
     )
     return result
 

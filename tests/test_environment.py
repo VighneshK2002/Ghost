@@ -47,3 +47,48 @@ def test_terminal_step_preserves_pre_reset_transition_observation() -> None:
     assert not bool(success[0])
     assert not bool(wrong[0])
     assert environment.transition_observation.shape == (1, config.observation_dim)
+
+
+def test_training_cue_schedule_enforces_each_segment_quota() -> None:
+    config = Config(
+        worlds=10,
+        cue_probability_schedule=((0, 0.8), (20, 0.2)),
+    )
+    environment = BatchedTMaze(config, seed=3, curriculum=True)
+
+    np.testing.assert_array_equal(environment.cue_assignment_counts, (8, 2))
+    assert environment.current_cue_probability_left == 0.8
+    assert environment.cue_assignment_probability_sum == 8.0
+
+    before = environment.cue_assignment_counts.copy()
+    environment.completed_transitions = 20
+    environment.reset(np.ones(config.worlds, dtype=bool))
+
+    np.testing.assert_array_equal(
+        environment.cue_assignment_counts - before,
+        (2, 8),
+    )
+    assert environment.current_cue_probability_left == 0.2
+    assert environment.cue_assignment_probability_sum == 10.0
+
+
+def test_training_without_schedule_preserves_legacy_random_sampler() -> None:
+    config = Config(worlds=8)
+    expected = np.random.default_rng(5).integers(0, 2, config.worlds)
+
+    environment = BatchedTMaze(config, seed=5, curriculum=True)
+
+    np.testing.assert_array_equal(environment.cue, expected)
+
+
+def test_evaluation_ignores_training_cue_schedule() -> None:
+    config = Config(
+        worlds=8,
+        cue_probability_schedule=((0, 1.0),),
+    )
+    expected = np.random.default_rng(5).integers(0, 2, config.worlds)
+
+    environment = BatchedTMaze(config, seed=5, curriculum=False)
+
+    np.testing.assert_array_equal(environment.cue, expected)
+    assert environment.current_cue_probability_left == 0.5

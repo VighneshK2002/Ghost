@@ -102,14 +102,18 @@ python -m venv .venv
 source .venv/bin/activate
 python -m pip install -e ".[dev]"
 
-# Full canonical run (compute-intensive; saves an ignored local checkpoint)
+# Historical six-seed reproduction (compute-intensive)
 python -m experiments.delayed_cue_tmaze.train \
-  --seed 11 --seeds 1 --transitions 65536 \
-  --evaluation-episodes 192
+  --preset historical-reward-eprop \
+  --condition separated --seed 11 --seeds 6 \
+  --worlds 24 --transitions 65536 --report-every 4096 \
+  --evaluation-episodes 192 --device cpu \
+  --checkpoint artifacts/historical_reward_eprop_reproduction.pt \
+  --summary results/delayed_cue_tmaze/historical_reproduction.json
 
 # Evaluate a checkpoint created by that command
 python -m experiments.delayed_cue_tmaze.evaluate \
-  --checkpoint artifacts/delayed_cue_tmaze.pt \
+  --checkpoint artifacts/historical_reward_eprop_reproduction.pt \
   --episodes 192 --seed 11
 
 # Fast execution smoke test and automated tests
@@ -117,7 +121,7 @@ python -m experiments.delayed_cue_tmaze.train \
   --seed 11 --transitions 8 --worlds 2 \
   --evaluation-episodes 4 --report-every 8 \
   --checkpoint artifacts/smoke.pt
-pytest
+python -m pytest
 
 # Regenerate public figures
 python results/delayed_cue_tmaze/plot_results.py
