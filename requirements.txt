@@ -7,3 +7,4 @@ pytest>=8
 marimo>=0.23
 anywidget>=0.9
 traitlets>=5
+wigglystuff>=0.5.32

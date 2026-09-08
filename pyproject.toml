@@ -17,7 +17,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["matplotlib>=3.8", "pytest>=8"]
-notebook = ["anywidget>=0.9", "marimo>=0.23", "traitlets>=5"]
+notebook = ["anywidget>=0.9", "marimo>=0.23", "traitlets>=5", "wigglystuff>=0.5.32", "matplotlib>=3.8"]
 
 [tool.setuptools.packages.find]
 include = ["ghost*", "environments*", "experiments*"]

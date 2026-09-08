@@ -48,6 +48,12 @@ def test_cli_parses_transition_indexed_cue_schedule() -> None:
     )
 
 
+def test_cli_parses_explicit_seed_list() -> None:
+    args = parser().parse_args(["--seed-list", "12,13,15,16"])
+
+    assert args.seed_list == (12, 13, 15, 16)
+
+
 @pytest.mark.parametrize(
     "value",
     ("100:0.5", "0:1.2", "0:0.5,100:0.8,50:0.2", "not-a-schedule"),

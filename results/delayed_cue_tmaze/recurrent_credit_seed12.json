@@ -1,0 +1,145 @@
+{
+  "results": [
+    {
+      "seed": 12,
+      "delay": 0,
+      "forward_max_error": 0.0,
+      "groups": {
+        "core": {
+          "eprop_norm": 0.39205461740493774,
+          "reference_norm": 0.369222491979599,
+          "cosine": 0.996073842048645,
+          "norm_ratio": 1.0618383926258759,
+          "relative_error": 0.11028244818751654
+        },
+        "non_core": {
+          "eprop_norm": 0.6919708251953125,
+          "reference_norm": 0.6919707655906677,
+          "cosine": 0.9999998807907104,
+          "norm_ratio": 1.0000000861375187,
+          "relative_error": 1.707417302819297e-07
+        },
+        "all": {
+          "eprop_norm": 0.7953175902366638,
+          "reference_norm": 0.7843140363693237,
+          "cosine": 0.9987685084342957,
+          "norm_ratio": 1.0140295256199632,
+          "relative_error": 0.05191639885714338
+        }
+      }
+    },
+    {
+      "seed": 12,
+      "delay": 1,
+      "forward_max_error": 0.0,
+      "groups": {
+        "core": {
+          "eprop_norm": 1.3477544784545898,
+          "reference_norm": 1.188538908958435,
+          "cosine": 0.9872388243675232,
+          "norm_ratio": 1.133959072181896,
+          "relative_error": 0.21653189654316413
+        },
+        "non_core": {
+          "eprop_norm": 2.0065808296203613,
+          "reference_norm": 2.1354403495788574,
+          "cosine": 0.9928125143051147,
+          "norm_ratio": 0.9396566989174344,
+          "relative_error": 0.1309561650369344
+        },
+        "all": {
+          "eprop_norm": 2.417189836502075,
+          "reference_norm": 2.4439163208007812,
+          "cosine": 0.9878362417221069,
+          "norm_ratio": 0.9890640755285972,
+          "relative_error": 0.15550752605134097
+        }
+      }
+    },
+    {
+      "seed": 12,
+      "delay": 4,
+      "forward_max_error": 0.0,
+      "groups": {
+        "core": {
+          "eprop_norm": 7.580697536468506,
+          "reference_norm": 5.913421154022217,
+          "cosine": 0.951303243637085,
+          "norm_ratio": 1.2819478503255655,
+          "relative_error": 0.45204918531807403
+        },
+        "non_core": {
+          "eprop_norm": 8.146988868713379,
+          "reference_norm": 9.80190372467041,
+          "cosine": 0.9530091285705566,
+          "norm_ratio": 0.8311639348393337,
+          "relative_error": 0.3265266941433684
+        },
+        "all": {
+          "eprop_norm": 11.1283597946167,
+          "reference_norm": 11.447525978088379,
+          "cosine": 0.9321480393409729,
+          "norm_ratio": 0.9721191998967643,
+          "relative_error": 0.36427710317928763
+        }
+      }
+    },
+    {
+      "seed": 12,
+      "delay": 8,
+      "forward_max_error": 0.0,
+      "groups": {
+        "core": {
+          "eprop_norm": 21.917213439941406,
+          "reference_norm": 15.983120918273926,
+          "cosine": 0.9025905132293701,
+          "norm_ratio": 1.3712724537347944,
+          "relative_error": 0.6363902969280081
+        },
+        "non_core": {
+          "eprop_norm": 18.325265884399414,
+          "reference_norm": 24.65105628967285,
+          "cosine": 0.9068835377693176,
+          "norm_ratio": 0.743386639057592,
+          "relative_error": 0.4519889853595407
+        },
+        "all": {
+          "eprop_norm": 28.568859100341797,
+          "reference_norm": 29.379148483276367,
+          "cosine": 0.8648046851158142,
+          "norm_ratio": 0.9724195756253516,
+          "relative_error": 0.5135117299173187
+        }
+      }
+    },
+    {
+      "seed": 12,
+      "delay": 16,
+      "forward_max_error": 0.0,
+      "groups": {
+        "core": {
+          "eprop_norm": 56.922332763671875,
+          "reference_norm": 38.02252197265625,
+          "cosine": 0.8268616795539856,
+          "norm_ratio": 1.4970688373750525,
+          "relative_error": 0.8749157250614404
+        },
+        "non_core": {
+          "eprop_norm": 38.40007400512695,
+          "reference_norm": 57.13192367553711,
+          "cosine": 0.8392171859741211,
+          "norm_ratio": 0.6721298975194352,
+          "relative_error": 0.5688874873128696
+        },
+        "all": {
+          "eprop_norm": 68.6637954711914,
+          "reference_norm": 68.62775421142578,
+          "cosine": 0.7704901099205017,
+          "norm_ratio": 1.0005251703218292,
+          "relative_error": 0.6776886102407991
+        }
+      }
+    }
+  ],
+  "scope": "Synthetic latent cue, fixed actions, zero predictor feedback, frozen weights; unit positive terminal TD multiplies decayed action-score sum. Not a maze rollout or full-system gradient."
+}

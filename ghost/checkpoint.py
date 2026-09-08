@@ -82,6 +82,7 @@ def load_system(
             module = getattr(system, name, None)
             if name in state and module is not None:
                 module.load_state_dict(state[name], strict=True)
+        system.timer_influence = float(state.get("timer_influence", 1.0))
     except (RuntimeError, CheckpointCompatibilityError) as error:
         raise CheckpointCompatibilityError(
             "checkpoint tensors are incompatible with the canonical engine; "

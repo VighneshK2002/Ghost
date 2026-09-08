@@ -1,0 +1,459 @@
+{
+  "config": {
+    "seed": 12,
+    "device": "cpu",
+    "worlds": 2,
+    "transitions": 65536,
+    "report_every": 4096,
+    "maze_width": 9,
+    "maze_height": 9,
+    "cue_steps": 2,
+    "episode_limit": 48,
+    "observation_dim": 15,
+    "latent_dim": 16,
+    "strategy_dim": 8,
+    "hidden_dim": 40,
+    "conditioning_dim": 24,
+    "snn_ticks": 5,
+    "membrane_decay": 0.9,
+    "predictor_membrane_decay": 0.97,
+    "strategy_membrane_decay": 0.98,
+    "surrogate_scale": 0.3,
+    "gamma": 0.99,
+    "actor_trace_decay": 0.85,
+    "strategy_trace_decay": 0.99,
+    "encoder_trace_decay": 0.99,
+    "predictor_trace_decay": 0.995,
+    "use_strategic_prediction_timer": false,
+    "prediction_timer_durations": [
+      1,
+      2,
+      4,
+      8,
+      16
+    ],
+    "strategy_retention": 0.95,
+    "learned_strategy_memory": true,
+    "persist_recurrent_state_across_episodes": false,
+    "td_clip": 3.0,
+    "encoder_lr": 0.0003,
+    "encoder_eprop_lr": 3e-05,
+    "encoder_target_tau": 0.005,
+    "jepa_variance_weight": 0.0,
+    "sigreg_weight": 0.0,
+    "sigreg_projections": 128,
+    "sigreg_frequency_samples": 8,
+    "sigreg_max_frequency": 5.0,
+    "sigreg_trace_decay": 0.99,
+    "strategy_sigreg_weight": 0.0,
+    "strategy_sigreg_projections": 128,
+    "strategy_sigreg_frequency_samples": 8,
+    "strategy_sigreg_max_frequency": 5.0,
+    "strategy_sigreg_trace_decay": 0.99,
+    "use_reward_adaln": false,
+    "reward_adaln_strength": 0.25,
+    "use_actor_encoder_eprop": false,
+    "use_representation_critic": false,
+    "representation_critic_lr": 0.0003,
+    "representation_critic_target_tau": 0.005,
+    "critic_encoder_weight": 0.0,
+    "predictor_lr": 0.0003,
+    "use_predictor_eprop": true,
+    "use_predictor_encoder_eprop": false,
+    "use_strategy_encoder_eprop": true,
+    "strategy_encoder_trace_decay": 0.99,
+    "strategy_encoder_eprop_lr": 1e-05,
+    "strategy_encoder_eprop_clip": 1.0,
+    "detach_predictor_from_encoder": true,
+    "predictor_reward_event_weight": 8.0,
+    "predictor_eprop_clip": 1.0,
+    "actor_eprop_lr": 0.0003,
+    "strategy_eprop_lr": 0.0003,
+    "critic_lr": 0.0003,
+    "terminal_outcome_variance": 0.01,
+    "timeout_penalty": -0.1,
+    "curriculum_success_threshold": 0.65,
+    "curriculum_min_episodes_per_cue": 32,
+    "curriculum_history_per_cue": 64,
+    "curriculum_episode_limits": [
+      16,
+      24,
+      36,
+      48
+    ],
+    "cue_probability_schedule": [],
+    "encoder_learning_mode": "reward_eprop",
+    "cue_aux_weight": 2.0,
+    "exploration_rate": 0.1,
+    "adaptive_exploration": false,
+    "adaptive_exploration_min": 0.02,
+    "adaptive_exploration_max": 0.25,
+    "adaptive_exploration_ema_decay": 0.98,
+    "adaptive_exploration_power": 2.0,
+    "adaptive_timer_arbitration": false,
+    "adaptive_timer_min_influence": 0.1,
+    "adaptive_timer_patience_episodes": 256,
+    "adaptive_timer_min_improvement": 0.02,
+    "adaptive_timer_exploration_threshold": 0.5,
+    "adaptive_timer_gate_ema_decay": 0.98,
+    "adaptive_timer_state_machine": false,
+    "timer_gate_scope": "all",
+    "adaptive_exploration_target": "actor",
+    "critic_diagnostics_dir": "",
+    "timer_controller_bootstrap_influence": 0.5,
+    "timer_controller_episodes_per_cue": 32,
+    "timer_controller_progress_threshold": 0.05,
+    "timer_controller_success_threshold": 0.1,
+    "timer_controller_imbalance_threshold": 0.3,
+    "timer_controller_timeout_threshold": 0.7,
+    "timer_controller_transition_hold_episodes": 256,
+    "training_predictor_feedback": "normal",
+    "evaluation_episodes": 192,
+    "checkpoint": "artifacts/delayed_cue_tmaze.pt"
+  },
+  "checks": [
+    {
+      "name": "baseline flags",
+      "max_error": 0.0,
+      "tolerance": 1e-05,
+      "passed": true
+    },
+    {
+      "name": "two-step analytic categorical eligibility",
+      "max_error": 2.081459449243539e-08,
+      "tolerance": 1e-05,
+      "passed": true
+    },
+    {
+      "name": "two-step analytic categorical eligibility",
+      "max_error": 5.340816100485313e-08,
+      "tolerance": 1e-05,
+      "passed": true
+    },
+    {
+      "name": "signed TD direction",
+      "max_error": 4.172325140938682e-08,
+      "tolerance": 1e-05,
+      "passed": true
+    },
+    {
+      "name": "selective trace reset",
+      "max_error": 0.0,
+      "tolerance": 1e-05,
+      "passed": true
+    },
+    {
+      "name": "other world trace preserved",
+      "max_error": 5.340816100485313e-08,
+      "tolerance": 1e-05,
+      "passed": true
+    },
+    {
+      "name": "actor autograd reference 1.0/0",
+      "max_error": 5.960464477539063e-08,
+      "tolerance": 1e-05,
+      "passed": true
+    },
+    {
+      "name": "actor autograd reference 1.0/1",
+      "max_error": 5.960464477539063e-08,
+      "tolerance": 1e-05,
+      "passed": true
+    },
+    {
+      "name": "actor autograd reference 1.0/2",
+      "max_error": 5.960464477539063e-08,
+      "tolerance": 1e-05,
+      "passed": true
+    },
+    {
+      "name": "actor autograd reference 1.0/3",
+      "max_error": 7.450580596923828e-09,
+      "tolerance": 1e-05,
+      "passed": true
+    },
+    {
+      "name": "actor autograd reference 1.0/4",
+      "max_error": 0.0,
+      "tolerance": 1e-05,
+      "passed": true
+    },
+    {
+      "name": "actor autograd reference 1.0/5",
+      "max_error": 0.0,
+      "tolerance": 1e-05,
+      "passed": true
+    },
+    {
+      "name": "actor autograd reference 1.0/6",
+      "max_error": 1.1920928955078125e-07,
+      "tolerance": 1e-05,
+      "passed": true
+    },
+    {
+      "name": "actor autograd reference 1.0/7",
+      "max_error": 0.0,
+      "tolerance": 1e-05,
+      "passed": true
+    },
+    {
+      "name": "actor autograd reference 1.0/8",
+      "max_error": 3.725290298461914e-09,
+      "tolerance": 1e-05,
+      "passed": true
+    },
+    {
+      "name": "actor autograd reference 1.0/9",
+      "max_error": 0.0,
+      "tolerance": 1e-05,
+      "passed": true
+    },
+    {
+      "name": "actor autograd reference 1.0/10",
+      "max_error": 0.0,
+      "tolerance": 1e-05,
+      "passed": true
+    },
+    {
+      "name": "actor autograd reference 1.0/11",
+      "max_error": 0.0,
+      "tolerance": 1e-05,
+      "passed": true
+    },
+    {
+      "name": "actor autograd reference 1.0/12",
+      "max_error": 2.9802322387695312e-08,
+      "tolerance": 1e-05,
+      "passed": true
+    },
+    {
+      "name": "actor autograd reference 1.0/13",
+      "max_error": 0.0,
+      "tolerance": 1e-05,
+      "passed": true
+    },
+    {
+      "name": "actor sampled-action probability TD sign 1.0",
+      "max_error": 0.0,
+      "tolerance": 1e-07,
+      "passed": true
+    },
+    {
+      "name": "actor autograd reference -1.0/0",
+      "max_error": 5.960464477539063e-08,
+      "tolerance": 1e-05,
+      "passed": true
+    },
+    {
+      "name": "actor autograd reference -1.0/1",
+      "max_error": 5.960464477539063e-08,
+      "tolerance": 1e-05,
+      "passed": true
+    },
+    {
+      "name": "actor autograd reference -1.0/2",
+      "max_error": 5.960464477539063e-08,
+      "tolerance": 1e-05,
+      "passed": true
+    },
+    {
+      "name": "actor autograd reference -1.0/3",
+      "max_error": 7.450580596923828e-09,
+      "tolerance": 1e-05,
+      "passed": true
+    },
+    {
+      "name": "actor autograd reference -1.0/4",
+      "max_error": 0.0,
+      "tolerance": 1e-05,
+      "passed": true
+    },
+    {
+      "name": "actor autograd reference -1.0/5",
+      "max_error": 0.0,
+      "tolerance": 1e-05,
+      "passed": true
+    },
+    {
+      "name": "actor autograd reference -1.0/6",
+      "max_error": 1.1920928955078125e-07,
+      "tolerance": 1e-05,
+      "passed": true
+    },
+    {
+      "name": "actor autograd reference -1.0/7",
+      "max_error": 0.0,
+      "tolerance": 1e-05,
+      "passed": true
+    },
+    {
+      "name": "actor autograd reference -1.0/8",
+      "max_error": 3.725290298461914e-09,
+      "tolerance": 1e-05,
+      "passed": true
+    },
+    {
+      "name": "actor autograd reference -1.0/9",
+      "max_error": 0.0,
+      "tolerance": 1e-05,
+      "passed": true
+    },
+    {
+      "name": "actor autograd reference -1.0/10",
+      "max_error": 0.0,
+      "tolerance": 1e-05,
+      "passed": true
+    },
+    {
+      "name": "actor autograd reference -1.0/11",
+      "max_error": 0.0,
+      "tolerance": 1e-05,
+      "passed": true
+    },
+    {
+      "name": "actor autograd reference -1.0/12",
+      "max_error": 2.9802322387695312e-08,
+      "tolerance": 1e-05,
+      "passed": true
+    },
+    {
+      "name": "actor autograd reference -1.0/13",
+      "max_error": 0.0,
+      "tolerance": 1e-05,
+      "passed": true
+    },
+    {
+      "name": "actor sampled-action probability TD sign -1.0",
+      "max_error": 0.0,
+      "tolerance": 1e-07,
+      "passed": true
+    },
+    {
+      "name": "strategy head first-step chain rule 6",
+      "max_error": 7.450580596923828e-09,
+      "tolerance": 1e-05,
+      "passed": true
+    },
+    {
+      "name": "strategy head first-step chain rule 7",
+      "max_error": 9.313225746154785e-10,
+      "tolerance": 1e-05,
+      "passed": true
+    },
+    {
+      "name": "strategy episode trace reset 0",
+      "max_error": 0.0,
+      "tolerance": 1e-05,
+      "passed": true
+    },
+    {
+      "name": "strategy episode trace reset 1",
+      "max_error": 0.0,
+      "tolerance": 1e-05,
+      "passed": true
+    },
+    {
+      "name": "strategy episode trace reset 2",
+      "max_error": 0.0,
+      "tolerance": 1e-05,
+      "passed": true
+    },
+    {
+      "name": "strategy episode trace reset 3",
+      "max_error": 0.0,
+      "tolerance": 1e-05,
+      "passed": true
+    },
+    {
+      "name": "strategy episode trace reset 4",
+      "max_error": 0.0,
+      "tolerance": 1e-05,
+      "passed": true
+    },
+    {
+      "name": "strategy episode trace reset 5",
+      "max_error": 0.0,
+      "tolerance": 1e-05,
+      "passed": true
+    },
+    {
+      "name": "strategy episode trace reset 6",
+      "max_error": 0.0,
+      "tolerance": 1e-05,
+      "passed": true
+    },
+    {
+      "name": "strategy episode trace reset 7",
+      "max_error": 0.0,
+      "tolerance": 1e-05,
+      "passed": true
+    },
+    {
+      "name": "strategy episode trace reset 8",
+      "max_error": 0.0,
+      "tolerance": 1e-05,
+      "passed": true
+    },
+    {
+      "name": "strategy episode trace reset 9",
+      "max_error": 0.0,
+      "tolerance": 1e-05,
+      "passed": true
+    },
+    {
+      "name": "strategy episode trace reset 10",
+      "max_error": 0.0,
+      "tolerance": 1e-05,
+      "passed": true
+    },
+    {
+      "name": "strategy episode trace reset 11",
+      "max_error": 0.0,
+      "tolerance": 1e-05,
+      "passed": true
+    },
+    {
+      "name": "strategy episode trace reset 12",
+      "max_error": 0.0,
+      "tolerance": 1e-05,
+      "passed": true
+    },
+    {
+      "name": "strategy episode trace reset 13",
+      "max_error": 0.0,
+      "tolerance": 1e-05,
+      "passed": true
+    },
+    {
+      "name": "strategy episode trace reset 14",
+      "max_error": 0.0,
+      "tolerance": 1e-05,
+      "passed": true
+    },
+    {
+      "name": "strategy episode trace reset 15",
+      "max_error": 0.0,
+      "tolerance": 1e-05,
+      "passed": true
+    },
+    {
+      "name": "feedback reset",
+      "max_error": 0.0,
+      "tolerance": 1e-05,
+      "passed": true
+    },
+    {
+      "name": "strategy memory reset",
+      "max_error": 0.0,
+      "tolerance": 1e-05,
+      "passed": true
+    }
+  ],
+  "passed": true,
+  "limitations": [
+    "No timer or adaptive/noisy strategy in this baseline.",
+    "Recurrent e-prop is not validated against multi-step BPTT here.",
+    "Terminal bootstrap and predictor-feedback causal paths require separate integration checks.",
+    "Passing these checks does not establish learning robustness."
+  ]
+}

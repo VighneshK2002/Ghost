@@ -13,11 +13,11 @@ Architecture and online learning
 --------------------------------
 * Stateless spiking online encoder: either the legacy reconstruction/cue
   baseline or JEPA with causal reward-conditioned Adaptive LayerNorm.
-* Stateful spiking predictor: one-step Gaussian prediction of a stop-gradient
-  EMA target-encoder latent.  Reward is revealed only to the target, so its
-  recurrent state must retain earlier evidence to predict the resulting
-  affective modulation.  Online LIF eligibility carries prediction gradients
-  across otherwise detached environment decisions.
+* Stateful spiking predictor: latent prediction of a stop-gradient EMA target
+  encoder.  The default is the historical one-step objective; an experimental
+  strategizer-controlled timer can instead supervise the same shared predictor
+  at a selected future step.  Reward is revealed only to the target, so its
+  recurrent state must retain earlier evidence to predict affective modulation.
 * Stateful spiking strategizer: predictor-feedback conditioned, deterministic
   strategy readout plus task-outcome desirability and uncertainty readouts.
   Bellec-style recurrent LIF eligibility and exact leaky-strategy-memory
@@ -76,6 +76,7 @@ app = marimo.App(width="full")
 ACTIONS = ("left", "right", "forward")
 ACTION_DIM = len(ACTIONS)
 CONDITIONS = ("separated", "stateless_strategizer", "actor_only")
+TRAINING_PREDICTOR_FEEDBACK_MODES = ("normal", "shuffle", "zero")
 
 
 @dataclass
@@ -104,6 +105,8 @@ class Config:
     strategy_trace_decay: float = 0.99
     encoder_trace_decay: float = 0.99
     predictor_trace_decay: float = 0.995
+    use_strategic_prediction_timer: bool = False
+    prediction_timer_durations: Tuple[int, ...] = (1, 2, 4, 8, 16)
     strategy_retention: float = 0.95
     learned_strategy_memory: bool = True
     persist_recurrent_state_across_episodes: bool = False
@@ -156,11 +159,42 @@ class Config:
     curriculum_success_threshold: float = 0.65
     curriculum_min_episodes_per_cue: int = 32
     curriculum_history_per_cue: int = 64
+    # Timeout anchors at start rows 1, 3, 5, and the farthest row.
     curriculum_episode_limits: Tuple[int, ...] = (16, 24, 36, 48)
+    # Empty selects geometry-adjusted defaults; custom entries are (length, mass).
+    curriculum_length_distributions: Tuple[Tuple[Tuple[int, float], ...], ...] = ()
+    curriculum_min_episodes_per_length: int = 8
+    curriculum_blend_episodes: int = 64
     cue_probability_schedule: Tuple[Tuple[int, float], ...] = ()
     encoder_learning_mode: str = "cue_auxiliary"
     cue_aux_weight: float = 2.0
     exploration_rate: float = 0.10
+    adaptive_exploration: bool = False
+    adaptive_exploration_min: float = 0.02
+    adaptive_exploration_max: float = 0.25
+    adaptive_exploration_ema_decay: float = 0.98
+    adaptive_exploration_power: float = 2.0
+    adaptive_timer_arbitration: bool = False
+    adaptive_timer_min_influence: float = 0.10
+    adaptive_timer_patience_episodes: int = 256
+    adaptive_timer_min_improvement: float = 0.02
+    adaptive_timer_exploration_threshold: float = 0.50
+    adaptive_timer_gate_ema_decay: float = 0.98
+    adaptive_timer_state_machine: bool = False
+    timer_gate_scope: str = "all"
+    adaptive_exploration_target: str = "actor"
+    critic_diagnostics_dir: str = ""
+    credit_capture_dir: str = ""
+    credit_capture_every: int = 8192
+    credit_capture_length: int = 16
+    timer_controller_bootstrap_influence: float = 0.50
+    timer_controller_episodes_per_cue: int = 32
+    timer_controller_progress_threshold: float = 0.05
+    timer_controller_success_threshold: float = 0.10
+    timer_controller_imbalance_threshold: float = 0.30
+    timer_controller_timeout_threshold: float = 0.70
+    timer_controller_transition_hold_episodes: int = 256
+    training_predictor_feedback: str = "normal"
     evaluation_episodes: int = 192
     checkpoint: str = "online_delayed_cue_strategy_tmaze_gated_memory_v8.pt"
 
@@ -192,24 +226,71 @@ class BatchedTMaze:
                       for y in range(1, cfg.maze_height-1)}
         self.valid.update((x, 1) for x in range(1, cfg.maze_width-1))
         full_start = cfg.maze_height-2
-        requested_rows = (1, 3, 5, full_start)
-        requested_limits = cfg.curriculum_episode_limits
-        if len(requested_rows) != len(requested_limits):
-            raise ValueError("curriculum rows and episode limits must align")
-        # Keep this robust to smaller custom mazes by dropping out-of-range
-        # stages and merging any duplicate final row into the harder limit.
-        curriculum_pairs = []
-        for row, limit in zip(requested_rows, requested_limits):
-            if row > full_start:
-                continue
-            if curriculum_pairs and curriculum_pairs[-1][0] == row:
-                curriculum_pairs[-1] = (row, limit)
-            else:
-                curriculum_pairs.append((row, limit))
-        self.start_rows = tuple(row for row, _ in curriculum_pairs)
-        self.episode_limits = tuple(limit for _, limit in curriculum_pairs)
-        self.curriculum_enabled = curriculum
-        self.curriculum_stage = 0 if curriculum else len(self.start_rows)-1
+        if full_start < 2 or cfg.maze_width < 5:
+            raise ValueError("Distributional T-maze requires height >= 4 and width >= 5")
+        if len(cfg.curriculum_episode_limits)!=4 or any(v<1 for v in cfg.curriculum_episode_limits):
+            raise ValueError("Provide four positive timeout anchors")
+        if cfg.curriculum_min_episodes_per_length<1:
+            raise ValueError("Length diagnostic sample minimum must be positive")
+        # Length counts corridor cells INCLUDING the junction: start_y = length.
+        # Distributional curricula avoid fixed-stage temporal shortcuts and retain
+        # shorter-delay rehearsal instead of switching to one deterministic start.
+        anchors = (
+            ((1,.80),(2,.15),(3,.05)),
+            ((1,.15),(2,.30),(3,.30),(4,.25)),
+            ((1,.03),(2,.07),(3,.15),(4,.25),(5,.25),(6,.25)),
+            ((1,.02),(2,.03),(3,.05),(4,.10),(5,.20),(6,.25),(7,.35)),
+        )
+        # Insert two convex blends per adjacent anchor pair. This makes each
+        # promotion one third of the former distribution shift (10 stages total).
+        # Explicit custom curricula are already stages and are not expanded.
+        defaults=[]
+        for left_entries,right_entries in zip(anchors,anchors[1:]):
+            left,right=dict(left_entries),dict(right_entries)
+            for alpha in (0.,1/3,2/3):
+                blended={h:(1-alpha)*left.get(h,0.)+alpha*right.get(h,0.)
+                    for h in sorted(set(left)|set(right))}
+                defaults.append(tuple((h,p) for h,p in blended.items() if p>0))
+        defaults.append(anchors[-1])
+        distributions=[]
+        for entries in cfg.curriculum_length_distributions or defaults:
+            distribution={}
+            for length, probability in (entries.items() if isinstance(entries,dict) else entries):
+                if int(length)!=length or length<1 or not np.isfinite(probability) or probability<=0:
+                    raise ValueError("Hallway lengths must be positive integers with positive finite mass")
+                if cfg.curriculum_length_distributions:
+                    if length>full_start:
+                        raise ValueError("Hallway length exceeds maze geometry")
+                    mapped=int(length)
+                else:
+                    # Merge long lengths for small mazes; extend the longest
+                    # default length to the farthest row for larger mazes.
+                    mapped=min(int(length),full_start) if full_start<=7 else (full_start if length==7 else int(length))
+                distribution[mapped]=distribution.get(mapped,0.)+float(probability)
+            if len(distribution)<2:
+                raise ValueError("Every curriculum stage needs multiple hallway lengths")
+            total=sum(distribution.values())
+            distribution={h:p/total for h,p in sorted(distribution.items())}
+            if distributions:
+                previous=distributions[-1]
+                if not set(previous)&set(distribution):
+                    raise ValueError("Adjacent hallway distributions must overlap")
+                support=sorted(set(previous)|set(distribution))
+                if any(sum(p for h,p in distribution.items() if h<=cut)>
+                       sum(p for h,p in previous.items() if h<=cut)+1e-9 for cut in support):
+                    raise ValueError("Later stages must shift probability toward longer hallways")
+            distributions.append(distribution)
+        self.curriculum_length_distributions=tuple(distributions)
+        # Metadata only: maxima do NOT determine individual episode starts.
+        self.start_rows=tuple(max(d) for d in distributions)
+        self.episode_limits=tuple(self._limit_for_length(h) for h in self.start_rows)
+        if cfg.curriculum_blend_episodes<0 or int(cfg.curriculum_blend_episodes)!=cfg.curriculum_blend_episodes:
+            raise ValueError("curriculum_blend_episodes must be a nonnegative integer")
+        self.curriculum_blend_completed=cfg.curriculum_blend_episodes
+        self.curriculum_enabled=curriculum
+        self.curriculum_stage=0 if curriculum else len(distributions)-1
+        # Independent stream preserves cue quotas/RNG and avoids length-cue coupling.
+        self.length_rng=np.random.default_rng(np.random.SeedSequence([seed, 71939]))
         self.curriculum_history = (
             deque(maxlen=cfg.curriculum_history_per_cue),
             deque(maxlen=cfg.curriculum_history_per_cue))
@@ -230,9 +311,77 @@ class BatchedTMaze:
         self.direction = np.zeros(b, np.int64)
         self.cue = np.zeros(b, np.int64)
         self.age = np.zeros(b, np.int64)
+        self.hallway_length = np.zeros(b, np.int64)
+        self.episode_time_limit = np.zeros(b, np.int64)
+        self.episode_stage = np.zeros(b, np.int64)
+        self.episode_blend = np.ones(b, np.float64)
         self.previous_action = np.full(b, 2, np.int64)
         self.episode = np.zeros(b, np.int64)
         self.reset(np.ones(b, bool))
+
+    @property
+    def curriculum_blend_fraction(self):
+        duration=self.cfg.curriculum_blend_episodes
+        return min(1.,self.curriculum_blend_completed/duration) if duration else 1.
+
+    @property
+    def current_length_distribution(self):
+        target=self.curriculum_length_distributions[self.curriculum_stage]
+        alpha=self.curriculum_blend_fraction
+        if self.curriculum_stage==0 or alpha>=1.:
+            return dict(target)
+        previous=self.curriculum_length_distributions[self.curriculum_stage-1]
+        blended={h:(1-alpha)*previous.get(h,0.)+alpha*target.get(h,0.)
+            for h in sorted(set(previous)|set(target))}
+        return {h:p for h,p in blended.items() if p>0}
+
+    def _limit_for_length(self, length: int) -> int:
+        # Preserve historical timeout anchors, interpolating by sampled length.
+        # The limit stays fixed for that episode even if another world promotes.
+        anchors={}
+        for row,limit in zip((1,3,5,self.cfg.maze_height-2),self.cfg.curriculum_episode_limits):
+            row=min(row,self.cfg.maze_height-2)
+            anchors[row]=max(anchors.get(row,0),int(limit))
+        rows=sorted(anchors)
+        interpolated=int(np.ceil(np.interp(length,rows,[anchors[r] for r in rows])))
+        shortest_route=(length-1)+1+max(self.center-1,self.cfg.maze_width-2-self.center)
+        return max(interpolated,shortest_route+2)
+
+    @staticmethod
+    def summarize_hallways(records, min_samples=8, distributions=()):
+        """Completed-episode diagnostics; empty cue/length groups remain missing."""
+        rows=[]
+        lengths=sorted({r["hallway_length"] for r in records} |
+                       {h for distribution in distributions for h in distribution})
+        for length in lengths:
+            group=[r for r in records if r["hallway_length"]==length]
+            row=dict(hallway_length=length,samples=len(group),
+                success=float(np.mean([r["success"] for r in group])) if group else None)
+            for cue,label in ((0,"left"),(1,"right")):
+                selected=[r["success"] for r in group if r["cue"]==cue]
+                row["samples_"+label]=len(selected)
+                row["success_"+label]=float(np.mean(selected)) if selected else None
+            rows.append(row)
+        enough=[r["success"] for r in rows if r["samples"]>=min_samples]
+        sampled=[r["hallway_length"] for r in records]
+        stage_rows=[]
+        for stage,distribution in enumerate(distributions,1):
+            group=[r for r in records if r["curriculum_stage"]==stage]
+            for length,probability in distribution.items():
+                count=sum(r["hallway_length"]==length for r in group)
+                stage_rows.append(dict(curriculum_stage=stage,hallway_length=length,
+                    probability=probability,samples=count,
+                    observed_probability=count/len(group) if group else None))
+        cue_rates=[float(np.mean([r["success"] for r in records if r["cue"]==cue]))
+            if any(r["cue"]==cue for r in records) else None for cue in (0,1)]
+        return dict(worst_cue_success=min(cue_rates) if all(v is not None for v in cue_rates) else None,
+            success_by_hallway_length=rows,
+            mean_hallway_length=float(np.mean(sampled)) if sampled else None,
+            min_hallway_length=min(sampled) if sampled else None,
+            max_hallway_length=max(sampled) if sampled else None,
+            worst_length_success=min(enough) if enough else None,
+            worst_length_min_samples=min_samples,
+            hallway_distribution_by_stage=stage_rows)
 
     def _validate_cue_probability_schedule(self) -> None:
         schedule = self.cue_probability_schedule
@@ -288,7 +437,13 @@ class BatchedTMaze:
         if not count:
             return
         self.x[mask] = self.center
-        self.y[mask] = self.start_rows[self.curriculum_stage]
+        distribution=self.current_length_distribution
+        self.episode_blend[mask]=self.curriculum_blend_fraction
+        sampled=self.length_rng.choice(list(distribution),size=count,p=list(distribution.values()))
+        self.hallway_length[mask]=sampled
+        self.episode_time_limit[mask]=[self._limit_for_length(int(h)) for h in sampled]
+        self.episode_stage[mask]=self.curriculum_stage
+        self.y[mask]=sampled
         self.direction[mask] = 0
         if self.curriculum_enabled and self.cue_probability_schedule:
             assignment_probability_left = self.current_cue_probability_left
@@ -358,7 +513,7 @@ class BatchedTMaze:
             successes[world], wrong[world] = correct, incorrect
             # Correct and incorrect goals remain signed sparse outcomes.
             rewards[world] = 1.0 if correct else -1.0 if incorrect else 0.0
-        timeout = self.age >= self.episode_limits[self.curriculum_stage]
+        timeout = self.age >= self.episode_time_limit
         pure_timeout = timeout & ~successes & ~wrong
         rewards[pure_timeout] = self.cfg.timeout_penalty
         done = successes | wrong | timeout
@@ -368,19 +523,30 @@ class BatchedTMaze:
         self.transition_observation = self.observation()
         cue = self.cue.copy()
         terminal_age = self.age.copy()
+        # Preserve completed episode metadata BEFORE auto-reset/promotion.
+        self.transition_hallway_length=self.hallway_length.copy()
+        self.transition_episode_stage=self.episode_stage.copy()
+        self.transition_episode_blend=self.episode_blend.copy()
+        self.transition_episode_time_limit=self.episode_time_limit.copy()
         if self.curriculum_enabled:
-            for world in np.flatnonzero(done):
+            # Progress the blend by completed episodes across all worlds. Only
+            # episodes sampled from the settled target count toward mastery.
+            self.curriculum_blend_completed=min(self.cfg.curriculum_blend_episodes,
+                self.curriculum_blend_completed+int(done.sum()))
+            for world in np.flatnonzero(done & (self.episode_stage==self.curriculum_stage)
+                                       & (self.episode_blend>=1.)):
                 self.curriculum_history[int(cue[world])].append(
                     float(successes[world]))
             enough_evidence = all(
                 len(history) >= self.cfg.curriculum_min_episodes_per_cue
                 for history in self.curriculum_history)
-            mastered = enough_evidence and all(
+            mastered = self.curriculum_blend_fraction>=1. and enough_evidence and all(
                 float(np.mean(history)) >=
                 self.cfg.curriculum_success_threshold
                 for history in self.curriculum_history)
             if mastered and self.curriculum_stage < len(self.start_rows)-1:
                 self.curriculum_stage += 1
+                self.curriculum_blend_completed=0
                 for history in self.curriculum_history:
                     history.clear()
         self.completed_transitions += self.cfg.worlds
@@ -391,6 +557,233 @@ class BatchedTMaze:
     def curriculum_rates(self) -> Tuple[float, float]:
         return tuple(float(np.mean(history)) if history else 0.0
                      for history in self.curriculum_history)
+
+
+class AdaptiveExploration:
+    """Bounded exploration controlled by the weaker cue's success EMA."""
+
+    def __init__(self, cfg: Config) -> None:
+        self.minimum = cfg.adaptive_exploration_min
+        self.maximum = cfg.adaptive_exploration_max
+        self.decay = cfg.adaptive_exploration_ema_decay
+        self.power = cfg.adaptive_exploration_power
+        self.success_ema = np.zeros(2, np.float64)
+
+    @property
+    def rate(self) -> float:
+        weakest = float(self.success_ema.min())
+        return self.minimum + (self.maximum-self.minimum)*(
+            1.0-weakest)**self.power
+
+    def update(self, done: np.ndarray, success: np.ndarray,
+               cue: np.ndarray) -> None:
+        for cue_value in (0, 1):
+            mask = done & (cue == cue_value)
+            count = int(mask.sum())
+            if count:
+                batch_success = float(success[mask].mean())
+                retained = self.decay**count
+                self.success_ema[cue_value] = (
+                    retained*self.success_ema[cue_value]
+                    +(1.0-retained)*batch_success)
+
+
+class AdaptiveTimerArbitration:
+    """Hand control from action exploration to the strategic timer."""
+
+    def __init__(self, cfg: Config, exploration: AdaptiveExploration) -> None:
+        self.exploration = exploration
+        self.minimum = cfg.adaptive_timer_min_influence
+        self.patience = cfg.adaptive_timer_patience_episodes
+        self.min_improvement = cfg.adaptive_timer_min_improvement
+        self.exploration_threshold = cfg.adaptive_timer_exploration_threshold
+        self.decay = cfg.adaptive_timer_gate_ema_decay
+        self.gate = self.minimum
+        self.stalled = False
+        self.rescue_latched = False
+        self.episodes_since_review = 0
+        self.review_success = 0.0
+        self.last_improvement = 0.0
+
+    @property
+    def exploration_pressure(self) -> float:
+        span = self.exploration.maximum-self.exploration.minimum
+        if span <= 0.0:
+            return 0.0
+        return float(np.clip(
+            (self.exploration.rate-self.exploration.minimum)/span,
+            0.0,
+            1.0,
+        ))
+
+    @property
+    def target(self) -> float:
+        inverse_exploration = 1.0-self.exploration_pressure
+        rescue = 1.0 if self.rescue_latched else 0.0
+        return max(self.minimum, inverse_exploration, rescue)
+
+    def update(self, done: np.ndarray) -> None:
+        completed = int(done.sum())
+        if not completed:
+            return
+        self.episodes_since_review += completed
+        weakest = float(self.exploration.success_ema.min())
+        if self.episodes_since_review >= self.patience:
+            self.last_improvement = weakest-self.review_success
+            self.stalled = (
+                self.exploration_pressure >= self.exploration_threshold
+                and self.last_improvement < self.min_improvement
+            )
+            self.rescue_latched = self.rescue_latched or self.stalled
+            self.review_success = weakest
+            self.episodes_since_review = 0
+        retained = self.decay**completed
+        self.gate = retained*self.gate+(1.0-retained)*self.target
+
+
+class AdaptiveTimerStateMachine:
+    """Select an exploration-led or timer-led path from online evidence."""
+
+    def __init__(self, cfg: Config, exploration: AdaptiveExploration) -> None:
+        self.exploration = exploration
+        self.minimum = cfg.adaptive_timer_min_influence
+        self.bootstrap = cfg.timer_controller_bootstrap_influence
+        self.episodes_per_cue = cfg.timer_controller_episodes_per_cue
+        self.progress_threshold = cfg.timer_controller_progress_threshold
+        self.maintenance_progress_threshold = (
+            cfg.adaptive_timer_min_improvement
+        )
+        self.success_threshold = cfg.timer_controller_success_threshold
+        self.imbalance_threshold = cfg.timer_controller_imbalance_threshold
+        self.timeout_threshold = cfg.timer_controller_timeout_threshold
+        self.transition_hold = cfg.timer_controller_transition_hold_episodes
+        self.decay = cfg.adaptive_timer_gate_ema_decay
+        self.outcome_decay = cfg.adaptive_exploration_ema_decay
+        self.gate = self.bootstrap
+        self.state = "bootstrap"
+        self.stalled = False
+        self.rescue_latched = False
+        self.last_improvement = 0.0
+        self.review_success = 0.0
+        self.cue_episodes = np.zeros(2, np.int64)
+        self.review_cue_episodes = np.zeros(2, np.int64)
+        self.timeout_ema = 0.0
+        self.wrong_ema = 0.0
+        self.curriculum_stage = 0
+        self.transition_episodes_remaining = 0
+
+    @property
+    def exploration_pressure(self) -> float:
+        span = self.exploration.maximum-self.exploration.minimum
+        if span <= 0.0:
+            return 0.0
+        return float(np.clip(
+            (self.exploration.rate-self.exploration.minimum)/span,
+            0.0,
+            1.0,
+        ))
+
+    @property
+    def target(self) -> float:
+        if self.rescue_latched:
+            return 1.0
+        if self.state == "bootstrap":
+            return self.bootstrap
+        inverse_exploration = 1.0-self.exploration_pressure
+        if self.state == "curriculum_transition":
+            return max(self.gate, inverse_exploration)
+        return max(self.minimum, inverse_exploration)
+
+    def _update_outcome_ema(self, completed: int, batch_value: float,
+                            current: float) -> float:
+        retained = self.outcome_decay**completed
+        return retained*current+(1.0-retained)*batch_value
+
+    def _review(self) -> None:
+        weaker = float(self.exploration.success_ema.min())
+        imbalance = float(np.ptp(self.exploration.success_ema))
+        self.last_improvement = weaker-self.review_success
+        competent = weaker >= 0.65
+        required_progress = (
+            self.progress_threshold
+            if self.state == "bootstrap"
+            else self.maintenance_progress_threshold
+        )
+        balanced_progress = (
+            weaker >= self.success_threshold
+            and imbalance <= self.imbalance_threshold
+            and self.timeout_ema <= self.timeout_threshold
+            and (self.last_improvement >= required_progress or competent)
+        )
+        self.stalled = not balanced_progress
+        if self.stalled:
+            self.rescue_latched = True
+            self.state = "timer_rescue"
+        else:
+            self.state = "balanced_progress"
+        self.review_success = weaker
+        self.review_cue_episodes = self.cue_episodes.copy()
+
+    def update(self, done: np.ndarray, success: np.ndarray,
+               wrong: np.ndarray, cue: np.ndarray,
+               curriculum_stage: int) -> None:
+        completed = int(done.sum())
+        if not completed:
+            return
+
+        finished_cues = cue[done]
+        self.cue_episodes += np.bincount(finished_cues, minlength=2)
+        timeout = done & ~success & ~wrong
+        self.timeout_ema = self._update_outcome_ema(
+            completed, float(timeout[done].mean()), self.timeout_ema)
+        self.wrong_ema = self._update_outcome_ema(
+            completed, float(wrong[done].mean()), self.wrong_ema)
+
+        if curriculum_stage != self.curriculum_stage:
+            self.curriculum_stage = curriculum_stage
+            self.transition_episodes_remaining = self.transition_hold
+            self.review_success = float(self.exploration.success_ema.min())
+            self.review_cue_episodes = self.cue_episodes.copy()
+            if not self.rescue_latched:
+                self.state = "curriculum_transition"
+
+        if self.transition_episodes_remaining > 0:
+            self.transition_episodes_remaining = max(
+                0, self.transition_episodes_remaining-completed)
+
+        evidence = self.cue_episodes-self.review_cue_episodes
+        enough_evidence = bool((evidence >= self.episodes_per_cue).all())
+        if enough_evidence and self.transition_episodes_remaining == 0:
+            self._review()
+
+        retained = self.decay**completed
+        self.gate = retained*self.gate+(1.0-retained)*self.target
+
+
+def apply_training_predictor_feedback(
+        feedback: torch.Tensor,
+        mode: str,
+        active: torch.Tensor,
+    ) -> torch.Tensor:
+    """Intervene on feedback without changing predictor learning or RNG state."""
+    if mode == "normal":
+        return feedback
+    if mode == "zero":
+        return torch.zeros_like(feedback)
+    if mode != "shuffle":
+        raise ValueError(
+            "training predictor feedback must be normal, shuffle, or zero"
+        )
+
+    # Terminal feedback is never consumed by the clean trajectory because the
+    # corresponding recurrent state is reset.  Shuffle only among active
+    # worlds so terminal prediction errors cannot leak into a new episode.
+    shuffled = torch.zeros_like(feedback)
+    indices = torch.nonzero(active, as_tuple=False).flatten()
+    if indices.numel() > 1:
+        sources = torch.roll(indices, 1)
+        shuffled[indices] = feedback[sources]
+    return shuffled
 
 
 class SurrogateSpike(torch.autograd.Function):
@@ -614,6 +1007,13 @@ class Strategizer(nn.Module):
             record_eligibility=True)
         self.norm = nn.LayerNorm(2*cfg.hidden_dim)
         self.strategy_head = nn.Linear(2*cfg.hidden_dim, cfg.strategy_dim)
+        self.timer_head = (
+            nn.Linear(2*cfg.hidden_dim, len(cfg.prediction_timer_durations))
+            if cfg.use_strategic_prediction_timer else None
+        )
+        if self.timer_head is not None:
+            nn.init.zeros_(self.timer_head.weight)
+            nn.init.zeros_(self.timer_head.bias)
         self.gate_head = (nn.Linear(2*cfg.hidden_dim, cfg.strategy_dim)
                           if cfg.learned_strategy_memory else None)
         if self.gate_head is not None:
@@ -623,8 +1023,10 @@ class Strategizer(nn.Module):
         # This head evaluates the actual deterministic strategy proposal.  Its
         # two scalars are expected signed return (desirability) and uncertainty
         # about that outcome, not variance of a strategy-sampling policy.
-        self.outcome_head = nn.Linear(
-            2*cfg.hidden_dim+cfg.strategy_dim, 2)
+        outcome_input_dim = 2*cfg.hidden_dim+cfg.strategy_dim
+        if self.timer_head is not None:
+            outcome_input_dim += len(cfg.prediction_timer_durations)
+        self.outcome_head = nn.Linear(outcome_input_dim, 2)
         # With sparse reward an arbitrary initial critic would manufacture TD
         # credit before any outcome had occurred.  A zero critic makes early
         # no-reward transitions genuinely censored until terminal evidence.
@@ -633,6 +1035,7 @@ class Strategizer(nn.Module):
 
     def forward(self, latent: torch.Tensor, feedback: torch.Tensor,
                 deterministic: bool = False,
+                timer_influence: float = 1.0,
                 previous_strategy: torch.Tensor | None = None):
         
         conditioning = self.feedback_encoder(feedback)
@@ -658,11 +1061,40 @@ class Strategizer(nn.Module):
         else:
             gate = torch.full_like(proposal, 1-self.cfg.strategy_retention)
             strategy = proposal
+        if self.timer_head is not None:
+            timer_logits = self.timer_head(feature)
+            timer_distribution = torch.distributions.Categorical(
+                logits=timer_logits)
+            timer_index = (
+                timer_logits.argmax(-1)
+                if deterministic else timer_distribution.sample()
+            )
+            timer_logp = timer_distribution.log_prob(timer_index)
+            timer_entropy = timer_distribution.entropy()
+            duration_values = torch.as_tensor(
+                self.cfg.prediction_timer_durations,
+                device=feature.device,
+                dtype=torch.long,
+            )
+            timer_duration = duration_values[timer_index]
+            timer_context = F.one_hot(
+                timer_index, len(self.cfg.prediction_timer_durations)
+            ).to(feature.dtype)
+        else:
+            timer_logits = None
+            timer_index = torch.zeros(
+                latent.shape[0], device=latent.device, dtype=torch.long)
+            timer_duration = torch.ones_like(timer_index)
+            timer_logp = torch.zeros_like(latent[:, 0])
+            timer_entropy = torch.zeros_like(timer_logp)
+            timer_context = None
         # The outcome loss trains only this calibration head.  Task gradients
         # reach the strategy core through the actor likelihood/e-prop path,
         # preserving the intended strategizer -> actor division of labour.
-        outcome = self.outcome_head(torch.cat(
-            (feature.detach(), strategy.detach()), -1))
+        outcome_inputs = [feature.detach(), strategy.detach()]
+        if timer_context is not None:
+            outcome_inputs.append(timer_influence*timer_context.detach())
+        outcome = self.outcome_head(torch.cat(outcome_inputs, -1))
         desirability = outcome[:, 0]
         outcome_logvar = outcome[:, 1].clamp(-5.0, 2.0)
         return {
@@ -674,6 +1106,11 @@ class Strategizer(nn.Module):
             "previous_strategy": previous_strategy,
             "desirability": desirability,
             "outcome_logvar": outcome_logvar,
+            "timer_logits": timer_logits,
+            "timer_index": timer_index,
+            "timer_duration": timer_duration,
+            "timer_logp": timer_logp,
+            "timer_entropy": timer_entropy,
         }
 
     def snapshot(self):
@@ -739,8 +1176,12 @@ class Predictor(nn.Module):
             cfg.conditioning_dim,
         )
 
+        timer_input_dim = (
+            len(cfg.prediction_timer_durations)
+            if cfg.use_strategic_prediction_timer else 0
+        )
         self.core = RecurrentSNN(
-            cfg.latent_dim+cfg.conditioning_dim+ACTION_DIM,
+            cfg.latent_dim+cfg.conditioning_dim+ACTION_DIM+timer_input_dim,
             cfg.hidden_dim, cfg, persistent=True,
             decay=cfg.predictor_membrane_decay,
             record_eligibility=True)
@@ -756,6 +1197,7 @@ class Predictor(nn.Module):
             strategy: torch.Tensor,
             desirability: torch.Tensor,
             action: torch.Tensor,
+            timer_index: torch.Tensor | None = None,
         ):
 
         strategy_context = torch.cat(
@@ -771,8 +1213,16 @@ class Predictor(nn.Module):
         )
 
         action_code = F.one_hot(action, ACTION_DIM).float()
-        feature = self.norm(self.core(torch.cat(
-            (latent, conditioning, action_code), -1)))
+        predictor_inputs = [latent, conditioning, action_code]
+        if self.cfg.use_strategic_prediction_timer:
+            if timer_index is None:
+                raise ValueError(
+                    "timer_index is required when strategic prediction timing is enabled"
+                )
+            predictor_inputs.append(F.one_hot(
+                timer_index, len(self.cfg.prediction_timer_durations)
+            ).to(latent.dtype))
+        feature = self.norm(self.core(torch.cat(predictor_inputs, -1)))
 
         delta = self.head(feature)
 
@@ -1360,15 +1810,23 @@ class RecurrentStrategyEprop:
                    previous_strategy: torch.Tensor,
                    actor_strategy: torch.Tensor,
                    actor_logp: torch.Tensor, keep: float,
-                   learned_gate: bool) -> float:
+                   learned_gate: bool,
+                   timer_logp: torch.Tensor | None = None) -> float:
+        output_parts = [proposal]
         if learned_gate:
-            combined = torch.cat((proposal, gate), -1)
-            combined_jacobians = self._current_output_jacobians(combined)
-            k = proposal.shape[-1]
-            proposal_jacobians = [value[:, :k]
-                                  for value in combined_jacobians]
-            gate_jacobians = [value[:, k:]
+            output_parts.append(gate)
+        if timer_logp is not None:
+            output_parts.append(timer_logp[:, None])
+        combined = torch.cat(output_parts, -1)
+        combined_jacobians = self._current_output_jacobians(combined)
+        k = proposal.shape[-1]
+        proposal_jacobians = [value[:, :k]
                               for value in combined_jacobians]
+        offset = k
+        if learned_gate:
+            gate_jacobians = [value[:, offset:offset+k]
+                              for value in combined_jacobians]
+            offset += k
             proposal_memory_jacobian = torch.stack([
                 torch.autograd.grad(
                     proposal[:, coordinate].sum(), previous_strategy,
@@ -1385,8 +1843,11 @@ class RecurrentStrategyEprop:
                  *gate_memory_jacobian
                 +gate[:, :, None]*proposal_memory_jacobian)
         else:
-            proposal_jacobians = self._current_output_jacobians(proposal)
             gate_jacobians = []
+        timer_jacobians = (
+            [value[:, offset] for value in combined_jacobians]
+            if timer_logp is not None else None
+        )
         memory_signal = torch.autograd.grad(
             actor_logp.sum(), actor_strategy, retain_graph=True)[0].detach()
         memory_square = torch.zeros((), device=proposal.device)
@@ -1411,6 +1872,8 @@ class RecurrentStrategyEprop:
                 view = (memory_signal.shape[0], memory_signal.shape[1]) + (
                     1,)*(memory.ndim-2)
                 score = (memory*memory_signal.view(view)).sum(1)
+                if timer_jacobians is not None:
+                    score = score + timer_jacobians[index]
                 reward_trace.mul_(self.decay).add_(score)
                 memory_square += memory.square().sum()
                 score_square += score.square().sum()
@@ -2163,8 +2626,20 @@ class ContinuousSIGReg:
 
 
 class System:
+    @property
+    def timer_credit_influence(self) -> float:
+        """Feedback-only arbitration leaves timer credit and context intact."""
+        return self.timer_influence if self.cfg.timer_gate_scope == "all" else 1.0
+
     def __init__(self, cfg: Config, condition: str,
                  device: torch.device, seed: int) -> None:
+        if cfg.timer_gate_scope not in ("all", "feedback-only"):
+            raise ValueError("timer_gate_scope must be all or feedback-only")
+        if cfg.adaptive_exploration_target not in ("actor", "strategy"):
+            raise ValueError("adaptive_exploration_target must be actor or strategy")
+        if cfg.adaptive_exploration_target == "strategy" and (
+                not cfg.adaptive_exploration or condition == "actor_only"):
+            raise ValueError("strategy exploration requires adaptive exploration and a strategizer")
         if cfg.encoder_learning_mode not in (
                 "cue_auxiliary", "reward_eprop", "hybrid"):
             raise ValueError(
@@ -2186,6 +2661,89 @@ class System:
                 "predictor_reward_event_weight must be at least 1")
         if cfg.predictor_eprop_clip < 0.0:
             raise ValueError("predictor_eprop_clip must be non-negative")
+        if not cfg.prediction_timer_durations:
+            raise ValueError("prediction_timer_durations must not be empty")
+        if any(duration < 1 for duration in cfg.prediction_timer_durations):
+            raise ValueError("prediction timer durations must be positive")
+        if len(set(cfg.prediction_timer_durations)) != len(
+                cfg.prediction_timer_durations):
+            raise ValueError("prediction timer durations must be unique")
+        if not 0.0 <= cfg.exploration_rate <= 1.0:
+            raise ValueError("exploration_rate must be in [0, 1]")
+        if not (
+            0.0 <= cfg.adaptive_exploration_min
+            <= cfg.adaptive_exploration_max <= 1.0
+        ):
+            raise ValueError(
+                "adaptive exploration bounds must satisfy 0 <= min <= max <= 1"
+            )
+        if not 0.0 <= cfg.adaptive_exploration_ema_decay < 1.0:
+            raise ValueError(
+                "adaptive_exploration_ema_decay must be in [0, 1)"
+            )
+        if cfg.adaptive_exploration_power <= 0.0:
+            raise ValueError("adaptive_exploration_power must be positive")
+        if not 0.0 <= cfg.adaptive_timer_min_influence <= 1.0:
+            raise ValueError("adaptive_timer_min_influence must be in [0, 1]")
+        if cfg.adaptive_timer_patience_episodes < 1:
+            raise ValueError("adaptive_timer_patience_episodes must be positive")
+        if cfg.adaptive_timer_min_improvement < 0.0:
+            raise ValueError("adaptive_timer_min_improvement must be non-negative")
+        if not 0.0 <= cfg.adaptive_timer_exploration_threshold <= 1.0:
+            raise ValueError(
+                "adaptive_timer_exploration_threshold must be in [0, 1]"
+            )
+        if not 0.0 <= cfg.adaptive_timer_gate_ema_decay < 1.0:
+            raise ValueError("adaptive_timer_gate_ema_decay must be in [0, 1)")
+        if cfg.adaptive_timer_arbitration and not (
+            cfg.adaptive_exploration and cfg.use_strategic_prediction_timer
+        ):
+            raise ValueError(
+                "adaptive timer arbitration requires adaptive exploration "
+                "and the strategic prediction timer"
+            )
+        if cfg.adaptive_timer_state_machine and not (
+            cfg.adaptive_exploration and cfg.use_strategic_prediction_timer
+        ):
+            raise ValueError(
+                "adaptive timer state machine requires adaptive exploration "
+                "and the strategic prediction timer"
+            )
+        if cfg.adaptive_timer_state_machine and cfg.adaptive_timer_arbitration:
+            raise ValueError(
+                "choose either adaptive timer arbitration or its state machine"
+            )
+        if not 0.0 <= cfg.timer_controller_bootstrap_influence <= 1.0:
+            raise ValueError(
+                "timer_controller_bootstrap_influence must be in [0, 1]"
+            )
+        if cfg.timer_controller_episodes_per_cue < 1:
+            raise ValueError("timer_controller_episodes_per_cue must be positive")
+        if cfg.timer_controller_progress_threshold < 0.0:
+            raise ValueError(
+                "timer_controller_progress_threshold must be non-negative"
+            )
+        if not 0.0 <= cfg.timer_controller_success_threshold <= 1.0:
+            raise ValueError(
+                "timer_controller_success_threshold must be in [0, 1]"
+            )
+        if not 0.0 <= cfg.timer_controller_imbalance_threshold <= 1.0:
+            raise ValueError(
+                "timer_controller_imbalance_threshold must be in [0, 1]"
+            )
+        if not 0.0 <= cfg.timer_controller_timeout_threshold <= 1.0:
+            raise ValueError(
+                "timer_controller_timeout_threshold must be in [0, 1]"
+            )
+        if cfg.timer_controller_transition_hold_episodes < 0:
+            raise ValueError(
+                "timer_controller_transition_hold_episodes must be non-negative"
+            )
+        if cfg.training_predictor_feedback not in (
+                TRAINING_PREDICTOR_FEEDBACK_MODES):
+            raise ValueError(
+                "training_predictor_feedback must be normal, shuffle, or zero"
+            )
         torch.manual_seed(seed)
         self.cfg, self.condition, self.device = cfg, condition, device
         self.encoder = StatelessEncoder(cfg).to(device)
@@ -2289,6 +2847,8 @@ class System:
             self.strategizer.strategy_head,
             *((self.strategizer.gate_head,)
               if self.strategizer.gate_head is not None else ()),
+            *((self.strategizer.timer_head,)
+              if self.strategizer.timer_head is not None else ()),
             self.strategizer.feedback_encoder))
         self.actor_eprop = RewardEprop(
             self.actor_parameters, cfg.worlds, cfg.actor_trace_decay,
@@ -2332,6 +2892,9 @@ class System:
             2 * cfg.latent_dim,
             device=device,
         )
+        self.timer_influence = 1.0
+        self.strategy_noise = torch.zeros(cfg.worlds, cfg.strategy_dim, device=device)
+        self.strategy_noise_valid = torch.zeros(cfg.worlds, dtype=torch.bool, device=device)
 
 
         self.strategy_memory = torch.zeros(
@@ -2359,6 +2922,7 @@ class System:
             target.mul_(1-tau).add_(online, alpha=tau)
 
     def reset(self, mask: torch.Tensor) -> None:
+        self.strategy_noise_valid[mask] = False
         if not self.cfg.persist_recurrent_state_across_episodes:
             self.strategizer.reset(mask); self.predictor.reset(mask)
             self.actor.reset(mask)
@@ -2386,7 +2950,8 @@ class System:
             self.strategy_encoder_eprop.reset(mask)
 
     def strategy_and_action(self, latent: torch.Tensor,
-                            deterministic: bool = False):
+                            deterministic: bool = False,
+                            exploration: float | None = None):
         strategy_latent = (
             latent
             if self.strategy_encoder_eprop is not None
@@ -2401,6 +2966,7 @@ class System:
 
         strategy = self.strategizer(
             strategy_latent, self.feedback.detach(), deterministic,
+            timer_influence=self.timer_credit_influence,
             previous_strategy=(self.strategy_memory.detach().requires_grad_(True)
                                if self.cfg.learned_strategy_memory else None))
         
@@ -2430,10 +2996,25 @@ class System:
             actor_strategy = strategy["strategy"]
             actor_desirability = strategy["desirability"]
             actor_outcome_logvar = strategy["outcome_logvar"]
+        exploration_amount = (
+            self.cfg.exploration_rate if exploration is None else exploration)
+        if self.cfg.adaptive_exploration_target == "strategy":
+            if not deterministic and exploration_amount > 0:
+                missing = ~self.strategy_noise_valid
+                self.strategy_noise[missing] = (
+                    2*torch.rand_like(self.strategy_noise[missing])-1)
+                self.strategy_noise_valid[missing] = True
+                # Episode-held, bounded additive readout noise. Memory above
+                # remains clean; identity derivative preserves policy credit.
+                actor_strategy = actor_strategy + exploration_amount*self.strategy_noise
+            exploration_amount = 0.0
         actor = self.actor(
             actor_latent, actor_strategy, actor_desirability,
             actor_outcome_logvar, deterministic,
-            exploration=0.0 if deterministic else self.cfg.exploration_rate)
+            exploration=(
+                0.0 if deterministic else
+                exploration_amount
+            ))
         return (strategy, actor, actor_strategy, actor_desirability,
                 actor_outcome_logvar)
 
@@ -2504,6 +3085,225 @@ def latent_reconstruction_update(
         visible_correct,
         visible_count,
         returned_sigreg_state,
+    )
+
+
+@dataclass
+class PendingTimedPrediction:
+    due_step: torch.Tensor
+    active: torch.Tensor
+    forecast: torch.Tensor
+    latent: torch.Tensor
+    strategy: torch.Tensor
+    desirability: torch.Tensor
+    action: torch.Tensor
+    timer_index: torch.Tensor
+    predictor_mem: torch.Tensor
+    predictor_spikes: torch.Tensor
+
+
+class TimedPredictionBuffer:
+    """Resolve strategy-timed latent forecasts without retaining BPTT graphs."""
+
+    def __init__(self, cfg: Config, device: torch.device) -> None:
+        self.cfg = cfg
+        self.device = device
+        self.step = 0
+        self.pending: List[PendingTimedPrediction] = []
+
+    def forecast(
+            self,
+            system: System,
+            latent: torch.Tensor,
+            strategy: torch.Tensor,
+            desirability: torch.Tensor,
+            action: torch.Tensor,
+            timer_index: torch.Tensor,
+            timer_duration: torch.Tensor,
+        ) -> torch.Tensor:
+        state = system.predictor.core.snapshot()
+        if state is None:
+            system.predictor.core.initial(latent.shape[0], latent.device)
+            state = system.predictor.core.snapshot()
+        assert state is not None
+        predicted = system.predictor(
+            latent.detach(), strategy.detach(), desirability.detach(), action,
+            timer_index,
+        )
+        self.pending.append(PendingTimedPrediction(
+            due_step=(self.step+timer_duration.detach()).clone(),
+            active=torch.ones_like(timer_duration, dtype=torch.bool),
+            forecast=predicted.detach().clone(),
+            latent=latent.detach().clone(),
+            strategy=strategy.detach().clone(),
+            desirability=desirability.detach().clone(),
+            action=action.detach().clone(),
+            timer_index=timer_index.detach().clone(),
+            predictor_mem=state[0].detach().clone(),
+            predictor_spikes=state[1].detach().clone(),
+        ))
+        return predicted
+
+    def resolve(
+            self,
+            system: System,
+            target_latent: torch.Tensor,
+            reward: torch.Tensor,
+            done: torch.Tensor,
+            train: bool,
+        ) -> Tuple[torch.Tensor, float, float, float, float, float]:
+        current_step = self.step+1
+        error_sum = torch.zeros_like(target_latent)
+        error_count = torch.zeros(
+            target_latent.shape[0], 1,
+            device=target_latent.device, dtype=target_latent.dtype)
+        replay_losses = []
+        squared_error_sum = torch.zeros((), device=target_latent.device)
+        scalar_count = 0
+        joy_error_sum = 0.0
+        joy_event_count = 0.0
+
+        live_state = system.predictor.core.snapshot()
+        live_output = system.predictor.core.last_output
+        live_records = system.predictor.core.last_eligibility_records
+
+        for pending in self.pending:
+            due = pending.active & (pending.due_step == current_step)
+            if bool(due.any()):
+                stored_error = target_latent.detach()[due]-pending.forecast[due]
+                error_sum[due] += stored_error
+                error_count[due] += 1
+                squared_error_sum += stored_error.square().sum()
+                scalar_count += stored_error.numel()
+                decisive = reward.detach()[due].abs() >= 0.5
+                if bool(decisive.any()):
+                    joy_error_sum += float(
+                        stored_error[decisive].square().mean(-1).sum())
+                    joy_event_count += float(decisive.sum())
+
+                if train:
+                    system.predictor.core.restore((
+                        pending.predictor_mem[due],
+                        pending.predictor_spikes[due],
+                    ))
+                    replay_prediction = system.predictor(
+                        pending.latent[due],
+                        pending.strategy[due],
+                        pending.desirability[due],
+                        pending.action[due],
+                        pending.timer_index[due],
+                    )
+                    per_world_mse = (
+                        target_latent.detach()[due]-replay_prediction
+                    ).square().mean(-1)
+                    reward_conditioned = (
+                        system.use_jepa and system.cfg.use_reward_adaln)
+                    event_strength = (
+                        reward.detach()[due].abs().clamp(max=1)
+                        if reward_conditioned
+                        else torch.zeros_like(reward[due])
+                    )
+                    weights = 1+(
+                        system.cfg.predictor_reward_event_weight-1
+                    )*event_strength
+                    replay_losses.append((per_world_mse*weights).sum())
+
+                pending.active[due] = False
+
+            # Never compare a forecast from one episode against the next one.
+            pending.active[done] = False
+
+        self.pending = [
+            pending for pending in self.pending
+            if bool(pending.active.any())
+        ]
+        self.step = current_step
+
+        if live_state is not None:
+            system.predictor.core.restore(live_state)
+        system.predictor.core.last_output = live_output
+        system.predictor.core.last_eligibility_records = live_records
+
+        prediction_loss = 0.0
+        predictor_gradient_norm = 0.0
+        if train and replay_losses:
+            # Normalize by resolved forecasts, not by the number of timer
+            # records, because several worlds can expire simultaneously.
+            resolved_worlds = max(error_count.sum().item(), 1.0)
+            loss = torch.stack(replay_losses).sum()/resolved_worlds
+            system.predictor_optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            gradient_norm = torch.sqrt(sum(
+                parameter.grad.square().sum()
+                for parameter in system.predictor.parameters()
+                if parameter.grad is not None
+            ))
+            if system.cfg.predictor_eprop_clip > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    system.predictor.parameters(),
+                    system.cfg.predictor_eprop_clip,
+                )
+                gradient_norm = torch.minimum(
+                    gradient_norm,
+                    torch.as_tensor(
+                        system.cfg.predictor_eprop_clip,
+                        device=gradient_norm.device,
+                    ),
+                )
+            system.predictor_optimizer.step()
+            prediction_loss = float(loss.detach())
+            predictor_gradient_norm = float(gradient_norm.detach())
+
+        prediction_mse = (
+            float(squared_error_sum/scalar_count)
+            if scalar_count else 0.0
+        )
+        mean_error = error_sum/error_count.clamp_min(1)
+        return (
+            mean_error,
+            prediction_loss,
+            prediction_mse,
+            joy_error_sum,
+            joy_event_count,
+            predictor_gradient_norm,
+        )
+
+
+def timed_predictor_update(
+        system: System,
+        buffer: TimedPredictionBuffer,
+        latent: torch.Tensor,
+        strategy: torch.Tensor,
+        desirability: torch.Tensor,
+        action: torch.Tensor,
+        timer_index: torch.Tensor,
+        timer_duration: torch.Tensor,
+        target_latent: torch.Tensor,
+        reward: torch.Tensor,
+        done: torch.Tensor,
+        train: bool = True,
+    ):
+    forecast = buffer.forecast(
+        system, latent, strategy, desirability, action,
+        timer_index, timer_duration,
+    )
+    (expired_error, prediction_loss, prediction_mse,
+     joy_error_sum, joy_event_count, predictor_gradient_norm) = buffer.resolve(
+        system, target_latent, reward, done, train,
+    )
+    predicted_change = forecast.detach()-latent.detach()
+    feedback = torch.cat((predicted_change, expired_error), -1)
+    return (
+        feedback,
+        prediction_loss,
+        prediction_mse,
+        joy_error_sum,
+        joy_event_count,
+        0.0,
+        predictor_gradient_norm,
+        0.0,
+        0.0,
+        0.0,
     )
 
 
@@ -2946,7 +3746,36 @@ def latent_distribution_health(
 def run_condition(cfg: Config, condition: str, seed: int,
                   device: torch.device, progress_callback=None):
     env = BatchedTMaze(cfg, seed*1000+17)
+    diagnostics = None
+    if cfg.critic_diagnostics_dir:
+        from experiments.delayed_cue_tmaze.critic_diagnostics import CriticDiagnostics
+        diagnostics = CriticDiagnostics(env, seed, condition)
     system = System(cfg, condition, device, seed)
+    capture = None
+    if cfg.credit_capture_dir:
+        if condition != "separated" or cfg.use_strategic_prediction_timer or cfg.adaptive_exploration or cfg.persist_recurrent_state_across_episodes:
+            raise ValueError("credit capture requires separated baseline without timer, adaptive exploration or episode persistence")
+        if cfg.credit_capture_every <= 0 or cfg.credit_capture_length <= 0:
+            raise ValueError("credit capture interval and length must be positive")
+        from experiments.delayed_cue_tmaze.capture_credit import CreditCapture
+        capture = CreditCapture(cfg, seed, condition)
+    exploration_scheduler = (
+        AdaptiveExploration(cfg) if cfg.adaptive_exploration else None
+    )
+    if cfg.adaptive_timer_state_machine and exploration_scheduler is not None:
+        timer_arbitration = AdaptiveTimerStateMachine(
+            cfg, exploration_scheduler
+        )
+    elif cfg.adaptive_timer_arbitration and exploration_scheduler is not None:
+        timer_arbitration = AdaptiveTimerArbitration(
+            cfg, exploration_scheduler
+        )
+    else:
+        timer_arbitration = None
+    timed_predictions = (
+        TimedPredictionBuffer(cfg, device)
+        if cfg.use_strategic_prediction_timer else None
+    )
     print(
         "predictor_encoder_eprop_enabled=",
         system.predictor_encoder_eprop is not None
@@ -2954,6 +3783,7 @@ def run_condition(cfg: Config, condition: str, seed: int,
     observation = torch.tensor(env.observation(), device=device)
     completed = episodes = successes = wrong_total = timeout_total = 0
     window_steps = window_episodes = window_successes = window_wrong = 0
+    window_hallways = []
     window_timeouts = 0
     sums: Dict[str, float] = {}
     strategy_values: List[torch.Tensor] = []
@@ -2983,6 +3813,7 @@ def run_condition(cfg: Config, condition: str, seed: int,
     reward_context = torch.zeros(cfg.worlds, device=device)
     reported_cue_assignments = np.zeros(2, np.int64)
     reported_cue_probability_sum = 0.0
+    timer_counts = np.zeros(len(cfg.prediction_timer_durations), np.int64)
 
     def add(name: str, value: float) -> None:
         sums[name] = sums.get(name, 0.0)+value
@@ -3015,8 +3846,26 @@ def run_condition(cfg: Config, condition: str, seed: int,
                     dtype=torch.long
                 )
             )
+        exploration_rate = (
+            exploration_scheduler.rate
+            if exploration_scheduler is not None
+            else cfg.exploration_rate
+        )
+        timer_influence = (
+            timer_arbitration.gate
+            if timer_arbitration is not None else 1.0
+        )
+        system.timer_influence = timer_influence
+        if capture is not None:
+            capture.before(system, env, latent, completed)
         (strategy, actor, actor_strategy, actor_desirability,
-         actor_outcome_logvar) = system.strategy_and_action(latent)
+         actor_outcome_logvar) = system.strategy_and_action(
+             latent, exploration=exploration_rate)
+        if cfg.use_strategic_prediction_timer:
+            timer_counts += np.bincount(
+                strategy["timer_index"].detach().cpu().numpy(),
+                minlength=len(cfg.prediction_timer_durations),
+            )
 
         decision_age = torch.tensor(
             decision_age_np,
@@ -3078,7 +3927,9 @@ def run_condition(cfg: Config, condition: str, seed: int,
                 strategy["proposal"], strategy["gate"],
                 strategy["previous_strategy"], actor_strategy,
                 actor["logp"], keep,
-                learned_gate=cfg.learned_strategy_memory)
+                learned_gate=cfg.learned_strategy_memory,
+                timer_logp=(system.timer_credit_influence*strategy["timer_logp"]
+                    if cfg.use_strategic_prediction_timer else None))
 
             strategy_encoder_trace = (
                 system.strategy_encoder_eprop.accumulate(
@@ -3167,8 +4018,27 @@ def run_condition(cfg: Config, condition: str, seed: int,
             else:
                 shuffle_tv = zero_tv = 0.0
 
+        if diagnostics is not None:
+            diagnostics.before(env, actor["action"].detach().cpu().numpy(),
+                               strategy["desirability"].detach().cpu().numpy(),
+                               strategy["outcome_logvar"].detach().cpu().numpy())
         next_np, reward_np, done_np, success_np, wrong_np, cue_np, age_np = (
             env.step(actor["action"].detach().cpu().numpy()))
+        if diagnostics is not None:
+            diagnostics.after(reward_np, done_np, cfg.gamma)
+        if exploration_scheduler is not None:
+            exploration_scheduler.update(done_np, success_np, cue_np)
+        if timer_arbitration is not None:
+            if isinstance(timer_arbitration, AdaptiveTimerStateMachine):
+                timer_arbitration.update(
+                    done_np,
+                    success_np,
+                    wrong_np,
+                    cue_np,
+                    env.curriculum_stage,
+                )
+            else:
+                timer_arbitration.update(done_np)
         next_observation = torch.tensor(next_np, device=device)
         prediction_observation = torch.tensor(
             env.transition_observation, device=device)
@@ -3197,23 +4067,43 @@ def run_condition(cfg: Config, condition: str, seed: int,
                     reward_latent_shift[rewarded].mean()
                     if bool(rewarded.any()) else 0.0)
 
-            (new_feedback, predictor_loss, prediction_mse,
-            joy_prediction_error, joy_event_count,
-            predictor_eligibility, predictor_eprop_gradient,
-            predictor_encoder_eligibility,
-            predictor_encoder_eprop_gradient,
-            sigreg_loss) = predictor_update(
-                system,
-                latent,
-                actor_strategy,
-                actor_desirability,
-                actor["action"],
-                target_next_latent,
-                valid_prediction,
-                reward,
-                train_encoder=True,
-                sigreg_state=sigreg_state,
-            )
+            if timed_predictions is not None:
+                (new_feedback, predictor_loss, prediction_mse,
+                 joy_prediction_error, joy_event_count,
+                 predictor_eligibility, predictor_eprop_gradient,
+                 predictor_encoder_eligibility,
+                 predictor_encoder_eprop_gradient,
+                 sigreg_loss) = timed_predictor_update(
+                    system,
+                    timed_predictions,
+                    latent,
+                    actor_strategy,
+                    actor_desirability,
+                    actor["action"],
+                    strategy["timer_index"],
+                    strategy["timer_duration"],
+                    target_next_latent,
+                    reward,
+                    done,
+                )
+            else:
+                (new_feedback, predictor_loss, prediction_mse,
+                joy_prediction_error, joy_event_count,
+                predictor_eligibility, predictor_eprop_gradient,
+                predictor_encoder_eligibility,
+                predictor_encoder_eprop_gradient,
+                sigreg_loss) = predictor_update(
+                    system,
+                    latent,
+                    actor_strategy,
+                    actor_desirability,
+                    actor["action"],
+                    target_next_latent,
+                    valid_prediction,
+                    reward,
+                    train_encoder=True,
+                    sigreg_state=sigreg_state,
+                )
 
             # The policy/value bootstrap must use the newly updated online
             # representation, not the slowly moving JEPA target.
@@ -3226,28 +4116,65 @@ def run_condition(cfg: Config, condition: str, seed: int,
              next_cue_visible_count, _) = latent_reconstruction_update(
                  system, next_observation, next_reward_context)
             
-            (
-                new_feedback,
-                predictor_loss,
-                prediction_mse,
-                joy_prediction_error,
-                joy_event_count,
-                predictor_eligibility,
-                predictor_eprop_gradient,
-                predictor_encoder_eligibility,
-                predictor_encoder_eprop_gradient,
-                sigreg_loss,
-            ) = predictor_update(
-                system,
-                latent,
-                actor_strategy,
-                actor_desirability,
-                actor["action"],
-                next_latent,
-                valid_prediction,
-                reward,
-            )
+            if timed_predictions is not None:
+                with torch.no_grad():
+                    timed_target_latent = system.encoder.encode(
+                        prediction_observation, reward)
+                (
+                    new_feedback,
+                    predictor_loss,
+                    prediction_mse,
+                    joy_prediction_error,
+                    joy_event_count,
+                    predictor_eligibility,
+                    predictor_eprop_gradient,
+                    predictor_encoder_eligibility,
+                    predictor_encoder_eprop_gradient,
+                    sigreg_loss,
+                ) = timed_predictor_update(
+                    system,
+                    timed_predictions,
+                    latent,
+                    actor_strategy,
+                    actor_desirability,
+                    actor["action"],
+                    strategy["timer_index"],
+                    strategy["timer_duration"],
+                    timed_target_latent,
+                    reward,
+                    done,
+                )
+            else:
+                (
+                    new_feedback,
+                    predictor_loss,
+                    prediction_mse,
+                    joy_prediction_error,
+                    joy_event_count,
+                    predictor_eligibility,
+                    predictor_eprop_gradient,
+                    predictor_encoder_eligibility,
+                    predictor_encoder_eprop_gradient,
+                    sigreg_loss,
+                ) = predictor_update(
+                    system,
+                    latent,
+                    actor_strategy,
+                    actor_desirability,
+                    actor["action"],
+                    next_latent,
+                    valid_prediction,
+                    reward,
+                )
             reward_latent_shift = 0.0
+
+        new_feedback = apply_training_predictor_feedback(
+            new_feedback,
+            cfg.training_predictor_feedback,
+            ~done,
+        )
+        if timed_predictions is not None:
+            new_feedback = timer_influence*new_feedback
 
         # Provisional next value advances from the current strategic state but
         # is immediately rolled back: no state or graph is consumed twice.
@@ -3257,6 +4184,7 @@ def run_condition(cfg: Config, condition: str, seed: int,
         with torch.no_grad():
             next_strategy = system.strategizer(
                 next_latent, system.feedback, deterministic=True,
+                timer_influence=system.timer_credit_influence,
                 previous_strategy=(system.strategy_memory.detach()
                     if cfg.learned_strategy_memory else None))
             next_value = next_strategy["desirability"]
@@ -3282,7 +4210,14 @@ def run_condition(cfg: Config, condition: str, seed: int,
               -strategy["desirability"].detach()).clamp(
                   -cfg.td_clip, cfg.td_clip)
 
+        if capture is not None:
+            capture.pre_update("actor", system.actor_eprop, td)
         actor_direction, actor_step = system.actor_eprop.apply(td)
+        if capture is not None:
+            capture.post_update("actor", system.actor_eprop)
+            capture.after(system, actor["action"], reward, done, td, latent,
+                          actor_strategy, actor_desirability, actor_outcome_logvar,
+                          actor["logp"])
         if system.encoder_eprop is not None:
             encoder_direction, encoder_step = system.encoder_eprop.apply(td)
         else:
@@ -3300,10 +4235,15 @@ def run_condition(cfg: Config, condition: str, seed: int,
         system.update_target_encoder()
         system.update_target_representation_critic()
         if condition != "actor_only":
+            if capture is not None:
+                capture.pre_update("strategy", system.strategy_eprop, td)
             strategy_direction, strategy_step = system.strategy_eprop.apply(
                 td,
                 minimizing_gradients=strategy_sigreg_gradients,
             )
+            if capture is not None:
+                capture.post_update("strategy", system.strategy_eprop)
+                capture.end_step()
         else:
             strategy_direction = strategy_step = 0.0
         target = reward+cfg.gamma*(~done).float()*next_value.detach()
@@ -3333,6 +4273,9 @@ def run_condition(cfg: Config, condition: str, seed: int,
                                int(wrong_np.sum()))
         episodes += finished; successes += won; wrong_total += lost
         timeout_total += timed_out
+        window_hallways.extend(dict(hallway_length=int(env.transition_hallway_length[w]),
+            curriculum_stage=int(env.transition_episode_stage[w])+1,cue=int(cue_np[w]),
+            success=float(success_np[w])) for w in np.flatnonzero(done_np))
         window_episodes += finished; window_successes += won
         window_wrong += lost; window_timeouts += timed_out
         hidden_mask = torch.tensor(
@@ -3355,7 +4298,13 @@ def run_condition(cfg: Config, condition: str, seed: int,
         timeout_mask = done & ~success_mask & ~wrong_mask
         for name, value in (
             ("reward", float(reward.mean())),
+            ("exploration_rate", exploration_rate),
+            ("timer_influence", timer_influence),
             ("entropy", float(actor["entropy"].detach().mean())),
+            ("timer_entropy", float(
+                strategy["timer_entropy"].detach().mean())),
+            ("timer_duration", float(
+                strategy["timer_duration"].detach().float().mean())),
             ("desirability", float(
                 strategy["desirability"].detach().mean())),
             ("outcome_std", float(
@@ -3530,7 +4479,30 @@ def run_condition(cfg: Config, condition: str, seed: int,
                 "window_wrong": window_wrong/max(window_episodes, 1),
                 "window_timeout": window_timeouts/max(window_episodes, 1),
                 "reward": sums["reward"]/decisions,
+                "exploration_rate": sums["exploration_rate"]/decisions,
+                "success_ema": (
+                    exploration_scheduler.success_ema.tolist()
+                    if exploration_scheduler is not None else None),
+                "timer_influence": sums["timer_influence"]/decisions,
+                "timer_arbitration_stalled": (
+                    timer_arbitration.stalled
+                    if timer_arbitration is not None else None),
+                "timer_rescue_latched": (
+                    timer_arbitration.rescue_latched
+                    if timer_arbitration is not None else None),
+                "timer_controller_state": (
+                    getattr(timer_arbitration, "state", None)
+                    if timer_arbitration is not None else None),
+                "timer_controller_timeout_ema": (
+                    getattr(timer_arbitration, "timeout_ema", None)
+                    if timer_arbitration is not None else None),
+                "timer_arbitration_improvement": (
+                    timer_arbitration.last_improvement
+                    if timer_arbitration is not None else None),
                 "entropy": sums["entropy"]/decisions,
+                "timer_entropy": sums["timer_entropy"]/decisions,
+                "timer_duration": sums["timer_duration"]/decisions,
+                "timer_counts": timer_counts.tolist(),
                 "td_abs": sums["td_abs"]/decisions,
                 "desirability": sums["desirability"]/decisions,
                 "outcome_std": sums["outcome_std"]/decisions,
@@ -3636,13 +4608,17 @@ def run_condition(cfg: Config, condition: str, seed: int,
                 "strategy_step": sums["strategy_step"]/decisions,
 
             }
+            progress["curriculum_blend_fraction"]=env.curriculum_blend_fraction
+            progress["current_length_distribution"]=env.current_length_distribution
+            progress.update(env.summarize_hallways(window_hallways,
+                cfg.curriculum_min_episodes_per_length,env.curriculum_length_distributions))
             if progress_callback is not None:
                 progress_callback(progress)
             print(
                 f"condition={condition:21s} seed={seed} transitions={completed} "
                 f"episodes={episodes} successes={successes} "
                 f"curriculum={env.curriculum_stage+1}/{len(env.start_rows)} "
-                f"start_y={env.start_rows[env.curriculum_stage]} "
+                f"length_distribution={env.current_length_distribution} blend={env.curriculum_blend_fraction:.2f} "
                 f"stage_limit={env.episode_limits[env.curriculum_stage]} "
                 f"cue_success=[{curriculum_rates[0]:.2f},"
                 f"{curriculum_rates[1]:.2f}] "
@@ -3653,7 +4629,25 @@ def run_condition(cfg: Config, condition: str, seed: int,
                 f"wrong_rate={window_wrong/max(window_episodes,1):.3f} "
                 f"timeout_rate={window_timeouts/max(window_episodes,1):.3f} "
                 f"reward={sums['reward']/decisions:+.4f} "
+                f"explore={sums['exploration_rate']/decisions:.3f} "
+                +(
+                    "success_ema=["
+                    f"{exploration_scheduler.success_ema[0]:.3f},"
+                    f"{exploration_scheduler.success_ema[1]:.3f}] "
+                    if exploration_scheduler is not None else ""
+                )+
+                (
+                    f"timer_weight={sums['timer_influence']/decisions:.3f} "
+                    f"timer_stalled={timer_arbitration.stalled} "
+                    f"timer_latched={timer_arbitration.rescue_latched} "
+                    f"timer_state={getattr(timer_arbitration, 'state', 'legacy')} "
+                    f"timer_progress={timer_arbitration.last_improvement:+.3f} "
+                    if timer_arbitration is not None else ""
+                )+
                 f"entropy={sums['entropy']/decisions:.3f} "
+                f"timer=[mean:{sums['timer_duration']/decisions:.2f},"
+                f"entropy:{sums['timer_entropy']/decisions:.3f},"
+                f"counts:{timer_counts.tolist()}] "
                 f"td={sums['td_abs']/decisions:.3f} "
                 f"desire={sums['desirability']/decisions:+.3f} "
                 f"outcome_std={sums['outcome_std']/decisions:.3f} "
@@ -3738,7 +4732,9 @@ def run_condition(cfg: Config, condition: str, seed: int,
                 f"critic_encoder:{sums['critic_encoder_step']/decisions:.5f},"
                 f"strategy:{sums['strategy_step']/decisions:.5f}]")
             window_steps = window_episodes = window_successes = window_wrong = 0
+            window_hallways.clear()
             window_timeouts = 0
+            timer_counts.fill(0)
             reported_cue_assignments = env.cue_assignment_counts.copy()
             reported_cue_probability_sum = env.cue_assignment_probability_sum
             sums.clear()
@@ -3756,18 +4752,48 @@ def run_condition(cfg: Config, condition: str, seed: int,
             for labels in strategy_delay_labels.values():
                 labels.clear()
 
+    if timer_arbitration is not None:
+        system.timer_influence = timer_arbitration.gate
     result = {"condition": condition, "seed": seed,
               "episodes": episodes, "successes": successes,
               "rate": successes/max(episodes, 1),
               "wrong": wrong_total/max(episodes, 1),
-              "timeout": timeout_total/max(episodes, 1), "system": system}
+              "timeout": timeout_total/max(episodes, 1),
+              "final_exploration_rate": (
+                  exploration_scheduler.rate
+                  if exploration_scheduler is not None
+                  else cfg.exploration_rate),
+              "final_success_ema": (
+                  exploration_scheduler.success_ema.tolist()
+                  if exploration_scheduler is not None else None),
+              "final_timer_influence": system.timer_influence,
+              "timer_arbitration_stalled": (
+                  timer_arbitration.stalled
+                  if timer_arbitration is not None else None),
+              "timer_rescue_latched": (
+                  timer_arbitration.rescue_latched
+                  if timer_arbitration is not None else None),
+              "timer_controller_state": (
+                  getattr(timer_arbitration, "state", None)
+                  if timer_arbitration is not None else None),
+              "timer_controller_timeout_ema": (
+                  getattr(timer_arbitration, "timeout_ema", None)
+                  if timer_arbitration is not None else None),
+              "timer_arbitration_improvement": (
+                  timer_arbitration.last_improvement
+                  if timer_arbitration is not None else None),
+              "system": system}
+    if diagnostics is not None:
+        diagnostics.save(cfg.critic_diagnostics_dir)
+    if capture is not None:
+        capture.flush()
     return result
 
 
 @torch.no_grad()
 def evaluate(system: System, cfg: Config, seed: int, intervention: str):
     # Curriculum is a training aid only.  Every intervention is evaluated
-    # from the original, maximally delayed start state.
+    # from the final, longest-biased hallway distribution.
     env = BatchedTMaze(cfg, seed+80_000, curriculum=False)
     system.strategizer.core.initial(cfg.worlds, system.device)
     system.predictor.core.initial(cfg.worlds, system.device)
@@ -3775,6 +4801,10 @@ def evaluate(system: System, cfg: Config, seed: int, intervention: str):
     system.feedback.zero_()
     system.strategy_memory.zero_(); system.desirability_memory.zero_()
     system.outcome_logvar_memory.zero_()
+    timed_predictions = (
+        TimedPredictionBuffer(cfg, system.device)
+        if cfg.use_strategic_prediction_timer else None
+    )
     episodes = successes = wrong = 0
 
     while episodes < cfg.evaluation_episodes:
@@ -3782,6 +4812,7 @@ def evaluate(system: System, cfg: Config, seed: int, intervention: str):
         latent, _, _ = system.encoder(observation)
         strategy = system.strategizer(
             latent.detach(), system.feedback.detach(), deterministic=False,
+            timer_influence=system.timer_credit_influence,
             previous_strategy=(system.strategy_memory
                 if cfg.learned_strategy_memory else None))
         if system.condition == "actor_only":
@@ -3826,36 +4857,49 @@ def evaluate(system: System, cfg: Config, seed: int, intervention: str):
         actor = system.actor(
             latent, actor_strategy, actor_desirability,
             actor_outcome_logvar, deterministic=False, exploration=0.0)
-        next_np, _, done_np, success_np, wrong_np, _, _ = env.step(
+        next_np, reward_np, done_np, success_np, wrong_np, _, _ = env.step(
             actor["action"].cpu().numpy())
         next_observation = torch.tensor(next_np, device=system.device)
         next_latent, _, _ = system.encoder(next_observation)
+        done = torch.tensor(
+            done_np, device=system.device, dtype=torch.bool)
+        reward = torch.tensor(reward_np, device=system.device)
 
-
-        predicted_next_latent = system.predictor(
-            latent,
-            actor_strategy,
-            actor_desirability,
-            actor["action"],
-        )
-
-        predicted_change = (
-            predicted_next_latent
-            - latent
-        )
-
-        prediction_error = (
-            next_latent
-            - predicted_next_latent
-        )
-
-        predictor_feedback = torch.cat(
-            (
-                predicted_change,
-                prediction_error,
-            ),
-            dim=-1,
-        )
+        if timed_predictions is not None:
+            prediction_observation = torch.tensor(
+                env.transition_observation, device=system.device)
+            target_encoder = (
+                system.target_encoder
+                if system.target_encoder is not None else system.encoder
+            )
+            target_latent = target_encoder.encode(
+                prediction_observation, reward)
+            predictor_feedback = timed_predictor_update(
+                system,
+                timed_predictions,
+                latent,
+                actor_strategy,
+                actor_desirability,
+                actor["action"],
+                strategy["timer_index"],
+                strategy["timer_duration"],
+                target_latent,
+                reward,
+                done,
+                train=False,
+            )[0]
+            predictor_feedback = system.timer_influence*predictor_feedback
+        else:
+            predicted_next_latent = system.predictor(
+                latent,
+                actor_strategy,
+                actor_desirability,
+                actor["action"],
+            )
+            predicted_change = predicted_next_latent-latent
+            prediction_error = next_latent-predicted_next_latent
+            predictor_feedback = torch.cat(
+                (predicted_change, prediction_error), dim=-1)
         if intervention == "predictor_shuffle":
             permutation = torch.roll(torch.arange(
                 cfg.worlds, device=system.device), 1)
@@ -3865,7 +4909,6 @@ def evaluate(system: System, cfg: Config, seed: int, intervention: str):
         system.feedback = predictor_feedback
 
 
-        done = torch.tensor(done_np, device=system.device)
         system.reset(done)
         episodes += int(done_np.sum()); successes += int(success_np.sum())
         wrong += int(wrong_np.sum())
@@ -3885,6 +4928,7 @@ def save(path: Path, cfg: Config, results) -> None:
         state = {
             name: getattr(system, name).state_dict() for name in
             ("encoder", "strategizer", "actor", "predictor")}
+        state["timer_influence"] = system.timer_influence
         if system.target_encoder is not None:
             state["target_encoder"] = system.target_encoder.state_dict()
         if system.representation_critic is not None:
@@ -4114,13 +5158,13 @@ def _(experiment_form, mo, terminal_api):
               f"reward=SPARSE_SIGNED_TERMINAL(+1/-1/timeout"
               f"{cfg.timeout_penalty:+.1f}) worlds={cfg.worlds} "
               f"episode_limit={cfg.episode_limit}")
-        print(f"start_curriculum={preview_env.start_rows} "
+        print(f"length_curriculum={preview_env.curriculum_length_distributions} "
               f"stage_limits={preview_env.episode_limits} "
               f"advance=min_cue_success>="
               f"{cfg.curriculum_success_threshold:.2f} "
               f"after>={cfg.curriculum_min_episodes_per_cue}"
               f"_episodes_per_cue "
-              f"evaluation_start_y={preview_env.start_rows[-1]}")
+              f"evaluation_lengths={preview_env.curriculum_length_distributions[-1]}")
         print(f"encoder=STATELESS_SNN predictor=STATEFUL_SNN "
               f"strategizer=STATEFUL_EXCEPT_CONTROL "
               f"actor=STATELESS_EXCEPT_CONTROL ticks={cfg.snn_ticks} "
