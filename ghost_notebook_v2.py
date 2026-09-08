@@ -19,13 +19,12 @@ def _():
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    from matplotlib.patches import ConnectionPatch
-    return mo, np, torch, nn, F, dataclass, asdict, deque, Dict, Iterable, List, Sequence, Tuple, math, plt, ConnectionPatch
+    return mo, np, torch, nn, F, dataclass, asdict, deque, Dict, Iterable, List, Sequence, Tuple, math, plt
 
 
 @app.cell
 def _(dataclass, np, torch, nn, F, deque, Dict, Iterable, List, Sequence, Tuple, math):
-    # Verbatim canonical definitions, tested against ghost_terminal_core.py.
+    # Core definitions adapted from ghost_terminal_core.py.
     # Duplicated intentionally so this notebook has no runtime ghost dependency.
     ACTIONS = ("left", "right", "forward")
     ACTION_DIM = len(ACTIONS)
@@ -39,7 +38,6 @@ def _(dataclass, np, torch, nn, F, deque, Dict, Iterable, List, Sequence, Tuple,
         maze_width: int = 9
         maze_height: int = 9
         cue_steps: int = 2
-        episode_limit: int = 48
         observation_dim: int = 15
         latent_dim: int = 16
         strategy_dim: int = 8
@@ -53,57 +51,29 @@ def _(dataclass, np, torch, nn, F, deque, Dict, Iterable, List, Sequence, Tuple,
         gamma: float = 0.99
         actor_trace_decay: float = 0.85
         strategy_trace_decay: float = 0.99
-        encoder_trace_decay: float = 0.99
         predictor_trace_decay: float = 0.995
         use_strategic_prediction_timer: bool = False
         prediction_timer_durations: Tuple[int, ...] = (1, 2, 4, 8, 16)
         strategy_retention: float = 0.95
         learned_strategy_memory: bool = True
-        persist_recurrent_state_across_episodes: bool = False
         td_clip: float = 3.0
-        encoder_lr: float = 3e-4
-        encoder_eprop_lr: float = 3e-5
-        jepa_variance_weight: float = 0.0
 
-        #SIGReg
-        sigreg_weight: float = 0.0
-        sigreg_projections: int = 128
-        sigreg_frequency_samples: int = 8
-        sigreg_max_frequency: float = 5.0
-        sigreg_trace_decay: float = 0.99
 
-        # Strategy SIGReg
-        strategy_sigreg_weight: float = 0.0
-        strategy_sigreg_projections: int = 128
-        strategy_sigreg_frequency_samples: int = 8
-        strategy_sigreg_max_frequency: float = 5.0
-        strategy_sigreg_trace_decay: float = 0.99
 
         use_reward_adaln: bool = True
         reward_adaln_strength: float = 0.25
-        use_actor_encoder_eprop: bool = False
-        use_representation_critic: bool = False
-        representation_critic_lr: float = 3e-4
-        representation_critic_target_tau: float = 0.005
-        critic_encoder_weight: float = 0.0
         predictor_lr: float = 3e-4
-        use_predictor_eprop: bool = True
-        use_predictor_encoder_eprop: bool = False
 
-        use_strategy_encoder_eprop: bool = True
         strategy_encoder_trace_decay: float = 0.99
         strategy_encoder_eprop_lr: float = 1e-5
         strategy_encoder_eprop_clip: float = 1.0
 
 
-        detach_predictor_from_encoder: bool = True
 
-        predictor_reward_event_weight: float = 8.0
         predictor_eprop_clip: float = 1.0
         actor_eprop_lr: float = 3e-4
         strategy_eprop_lr: float = 3e-4
         critic_lr: float = 3e-4
-        terminal_outcome_variance: float = 0.01
         timeout_penalty: float = -0.1
         curriculum_success_threshold: float = 0.65
         curriculum_min_episodes_per_cue: int = 32
@@ -116,35 +86,6 @@ def _(dataclass, np, torch, nn, F, deque, Dict, Iterable, List, Sequence, Tuple,
         curriculum_blend_episodes: int = 64
         cue_probability_schedule: Tuple[Tuple[int, float], ...] = ()
         encoder_learning_mode: str = "cue_auxiliary"
-        cue_aux_weight: float = 2.0
-        exploration_rate: float = 0.10
-        adaptive_exploration: bool = False
-        adaptive_exploration_min: float = 0.02
-        adaptive_exploration_max: float = 0.25
-        adaptive_exploration_ema_decay: float = 0.98
-        adaptive_exploration_power: float = 2.0
-        adaptive_timer_arbitration: bool = False
-        adaptive_timer_min_influence: float = 0.10
-        adaptive_timer_patience_episodes: int = 256
-        adaptive_timer_min_improvement: float = 0.02
-        adaptive_timer_exploration_threshold: float = 0.50
-        adaptive_timer_gate_ema_decay: float = 0.98
-        adaptive_timer_state_machine: bool = False
-        timer_gate_scope: str = "all"
-        adaptive_exploration_target: str = "actor"
-        critic_diagnostics_dir: str = ""
-        credit_capture_dir: str = ""
-        credit_capture_every: int = 8192
-        credit_capture_length: int = 16
-        timer_controller_bootstrap_influence: float = 0.50
-        timer_controller_episodes_per_cue: int = 32
-        timer_controller_progress_threshold: float = 0.05
-        timer_controller_success_threshold: float = 0.10
-        timer_controller_imbalance_threshold: float = 0.30
-        timer_controller_timeout_threshold: float = 0.70
-        timer_controller_transition_hold_episodes: int = 256
-        training_predictor_feedback: str = "normal"
-        evaluation_episodes: int = 192
         checkpoint: str = "online_delayed_cue_strategy_tmaze_gated_memory_v8.pt"
 
 
@@ -949,30 +890,6 @@ def _(dataclass, np, torch, nn, F, deque, Dict, Iterable, List, Sequence, Tuple,
             self.core.reset(mask)
 
 
-    class RepresentationCritic(nn.Module):
-        """Strategy-conditioned value head with a differentiable latent input."""
-
-        def __init__(self, cfg: Config) -> None:
-            super().__init__()
-            self.network = nn.Sequential(
-                nn.Linear(cfg.latent_dim+cfg.strategy_dim, cfg.hidden_dim),
-                nn.LayerNorm(cfg.hidden_dim),
-                nn.GELU(),
-                nn.Linear(cfg.hidden_dim, 2),
-            )
-            final = self.network[-1]
-            nn.init.zeros_(final.weight)
-            nn.init.zeros_(final.bias)
-
-        def forward(
-                self, latent: torch.Tensor,
-                strategy: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-            outcome = self.network(torch.cat((latent, strategy), -1))
-            value = outcome[:, 0]
-            logvar = outcome[:, 1].clamp(-5.0, 2.0)
-            return value, logvar
-
-
     def module_parameters(modules: Iterable[nn.Module]) -> List[nn.Parameter]:
         result: List[nn.Parameter] = []
         seen = set()
@@ -1347,7 +1264,6 @@ def _(dataclass, np, torch, nn, F, deque, Dict, Iterable, List, Sequence, Tuple,
         def apply(
                 self,
                 td_error: torch.Tensor,
-                minimizing_gradients: Sequence[torch.Tensor | None] | None = None,
             ) -> Tuple[float, float]:
 
             self.optimizer.zero_grad(set_to_none=True)
@@ -1357,9 +1273,7 @@ def _(dataclass, np, torch, nn, F, deque, Dict, Iterable, List, Sequence, Tuple,
                 device=td_error.device,
             )
 
-            for index, (parameter, trace) in enumerate(
-                zip(self.parameters, self.reward_traces)
-            ):
+            for parameter, trace in zip(self.parameters, self.reward_traces):
                 view = (
                     td_error.shape[0],
                 ) + (1,) * (trace.ndim - 1)
@@ -1369,20 +1283,7 @@ def _(dataclass, np, torch, nn, F, deque, Dict, Iterable, List, Sequence, Tuple,
                     trace * td_error.view(view)
                 ).mean(dim=0)
 
-                combined_direction = task_direction
-
-                # SIGReg is a loss that should be minimized. Because this
-                # optimizer uses maximize=True, subtract its gradient.
-                if minimizing_gradients is not None:
-                    regularization_gradient = minimizing_gradients[index]
-
-                    if regularization_gradient is not None:
-                        combined_direction = (
-                            combined_direction
-                            - regularization_gradient
-                        )
-
-                parameter.grad = combined_direction
+                parameter.grad = task_direction
 
                 # Preserve the existing task-gradient diagnostic.
                 task_direction_square += task_direction.square().sum()
@@ -1899,7 +1800,7 @@ def _(dataclass, np, torch, nn, F, deque, Dict, Iterable, List, Sequence, Tuple,
 
 
 
-    return Config, BatchedTMaze, SurrogateSpike, RecurrentSNN, mlp, RewardAdaptiveLayerNorm, StatelessEncoder, Strategizer, Actor, Predictor, RepresentationCritic, module_parameters, RewardEprop, PredictorEprop, RecurrentStrategyEprop, StrategyEncoderEprop
+    return Config, BatchedTMaze, SurrogateSpike, RecurrentSNN, mlp, RewardAdaptiveLayerNorm, StatelessEncoder, Strategizer, Actor, Predictor, module_parameters, RewardEprop, PredictorEprop, RecurrentStrategyEprop, StrategyEncoderEprop
 
 
 @app.cell
@@ -1916,14 +1817,14 @@ def _(dataclass, Config, BatchedTMaze, nn, torch, F, np, RecurrentSNN,
         max_prediction_age: int = 16
         strategy_min_std: float = .05
         strategy_entropy_weight: float = .001
-        adaptive_strategy_exploration: bool = False
-        adaptive_actor_exploration: bool = False
+        adaptive_strategy_exploration: bool = True
+        adaptive_actor_exploration: bool = True
         exploration_window: int = 100
         exploration_warmup: int = 20
         exploration_target_success: float = .8
         strategy_exploration_max: float = 2.
         actor_temperature_max: float = 2.
-        cue_success_bonus: bool = False
+        cue_success_bonus: bool = True
         cue_bonus_scale: float = .1
         cue_bonus_window: int = 100
         cue_bonus_min_samples: int = 10
@@ -2640,27 +2541,6 @@ def _(torch,np,BatchedTMaze):
 
 @app.cell
 def _(np,plt):
-    def critic_spike_density(history,threshold=.15,window=20):
-        """Trailing episode exceedance frequency; no stage-dependent reset.
-
-        Each above-threshold episode counts once, including consecutive episodes.
-        Early windows divide by available episodes, not the requested window size.
-        """
-        if threshold<0 or window<1:
-            raise ValueError("Spike threshold must be nonnegative and window positive")
-        losses=np.asarray([r["critic_loss"] for r in history],dtype=float)
-        spikes=losses>threshold
-        counts=[];fractions=[];excess=[];magnitudes=[];combined=[]
-        for i in range(len(losses)):
-            start=max(0,i-window+1)
-            counts.append(int(spikes[start:i+1].sum()))
-            fractions.append(counts[-1]/(i-start+1))
-            excess.append(float(np.maximum(losses[start:i+1]-threshold,0.).mean()))
-            magnitudes.append(excess[-1]/fractions[-1] if counts[-1] else 0.)
-            combined.append(fractions[-1]*magnitudes[-1])
-        return dict(spikes=spikes,counts=counts,fractions=fractions,mean_excess=excess,
-            spike_magnitude=magnitudes,density_times_magnitude=combined)
-
     def training_plot(history,window=100):
         """All rolling windows span curriculum changes; boundaries are annotations only."""
         x=np.arange(1,len(history)+1)
@@ -2719,7 +2599,7 @@ def _(np,plt):
         fig.suptitle(f"Training · {len(history)} episodes · rolling {window} episodes; all windows continuous")
         plt.close(fig)
         return fig
-    return training_plot,critic_spike_density
+    return (training_plot,)
 
 
 @app.cell
@@ -2730,6 +2610,7 @@ def _(mo):
     rolling window. After warmup, success below the configured target increases
     strategy standard deviation and/or actor temperature linearly, up to their
     respective maxima at zero success. At or above the target both return to 1.
+    Both adaptive exploration options default on.
     Controls are fixed within each episode. Strategy adaptation requires stochastic
     strategy; evaluation stays deterministic. Per-episode multipliers are exported.
 
@@ -2738,7 +2619,7 @@ def _(mo):
     Rates use only prior training episodes in a continuous rolling window, with
     a minimum sample count for each cue. The bonus enters actor reward and critic /
     strategy TD targets. Evaluation and plotted success rates / raw returns stay
-    unbonused. The bonus defaults off.
+    unbonused. The bonus defaults on.
 
     Strategy uses **external TD only**. The bank uses a fixed USE rule; there is no learned manager. The critic observes the
     pre-decision state; its value is not an actor input or a selection weight.
@@ -2819,14 +2700,14 @@ def _(mo):
         "strategy_min_std":mo.ui.number(value=.05,start=.001,stop=1.,step=.01,label="Minimum strategy std"),
         "strategy_entropy_weight":mo.ui.number(value=.001,start=0.,stop=.1,step=.001,label="Strategy entropy weight"),
         "curriculum_blend_episodes":mo.ui.number(value=64,start=0,step=1,label="Episodes to blend into next curriculum (0 = immediate)"),
-        "adaptive_strategy_exploration":mo.ui.checkbox(value=False,label="Adaptive strategy exploration (requires stochastic strategy)"),
-        "adaptive_actor_exploration":mo.ui.checkbox(value=False,label="Adaptive actor exploration"),
+        "adaptive_strategy_exploration":mo.ui.checkbox(value=True,label="Adaptive strategy exploration (requires stochastic strategy)"),
+        "adaptive_actor_exploration":mo.ui.checkbox(value=True,label="Adaptive actor exploration"),
         "exploration_window":mo.ui.number(value=100,start=1,step=1,label="Exploration success window (episodes)"),
         "exploration_warmup":mo.ui.number(value=20,start=1,step=1,label="Exploration warmup (≤ window)"),
         "exploration_target_success":mo.ui.number(value=.8,start=.01,stop=1.,step=.05,label="Success target for baseline exploration"),
         "strategy_exploration_max":mo.ui.number(value=2.,start=1.,step=.1,label="Maximum strategy std multiplier"),
         "actor_temperature_max":mo.ui.number(value=2.,start=1.,step=.1,label="Maximum actor temperature"),
-        "cue_success_bonus":mo.ui.checkbox(value=False,label="Reward successful episodes more for the weaker cue"),
+        "cue_success_bonus":mo.ui.checkbox(value=True,label="Reward successful episodes more for the weaker cue"),
         "cue_bonus_scale":mo.ui.number(value=.1,start=0.,step=.05,label="Maximum weaker-cue success bonus"),
         "cue_bonus_window":mo.ui.number(value=100,start=2,step=1,label="Cue bonus history (completed training episodes)"),
         "cue_bonus_min_samples":mo.ui.number(value=10,start=1,step=1,label="Minimum episodes per cue before bonus (window ≥ 2× minimum)"),
@@ -2964,7 +2845,66 @@ def _(torch, Settings, PredictiveAgent):
         # load a checkpoint whose environment or forward-pass configuration differs.
         from dataclasses import asdict
         if {k:v for k,v in payload.get("ghost_config", {}).items()
-                if k != "encoder_target_tau"} != asdict(loaded.cfg):
+                # Ignore only known obsolete fields from older checkpoints.
+                if k not in (
+                    'encoder_target_tau',
+                    'episode_limit',
+                    'encoder_trace_decay',
+                    'persist_recurrent_state_across_episodes',
+                    'encoder_lr',
+                    'encoder_eprop_lr',
+                    'jepa_variance_weight',
+                    'sigreg_weight',
+                    'sigreg_projections',
+                    'sigreg_frequency_samples',
+                    'sigreg_max_frequency',
+                    'sigreg_trace_decay',
+                    'strategy_sigreg_weight',
+                    'strategy_sigreg_projections',
+                    'strategy_sigreg_frequency_samples',
+                    'strategy_sigreg_max_frequency',
+                    'strategy_sigreg_trace_decay',
+                    'use_actor_encoder_eprop',
+                    'use_representation_critic',
+                    'representation_critic_lr',
+                    'representation_critic_target_tau',
+                    'critic_encoder_weight',
+                    'use_predictor_eprop',
+                    'use_predictor_encoder_eprop',
+                    'use_strategy_encoder_eprop',
+                    'detach_predictor_from_encoder',
+                    'predictor_reward_event_weight',
+                    'terminal_outcome_variance',
+                    'cue_aux_weight',
+                    'exploration_rate',
+                    'adaptive_exploration',
+                    'adaptive_exploration_min',
+                    'adaptive_exploration_max',
+                    'adaptive_exploration_ema_decay',
+                    'adaptive_exploration_power',
+                    'adaptive_timer_arbitration',
+                    'adaptive_timer_min_influence',
+                    'adaptive_timer_patience_episodes',
+                    'adaptive_timer_min_improvement',
+                    'adaptive_timer_exploration_threshold',
+                    'adaptive_timer_gate_ema_decay',
+                    'adaptive_timer_state_machine',
+                    'timer_gate_scope',
+                    'adaptive_exploration_target',
+                    'critic_diagnostics_dir',
+                    'credit_capture_dir',
+                    'credit_capture_every',
+                    'credit_capture_length',
+                    'timer_controller_bootstrap_influence',
+                    'timer_controller_episodes_per_cue',
+                    'timer_controller_progress_threshold',
+                    'timer_controller_success_threshold',
+                    'timer_controller_imbalance_threshold',
+                    'timer_controller_timeout_threshold',
+                    'timer_controller_transition_hold_episodes',
+                    'training_predictor_feedback',
+                    'evaluation_episodes',
+                )} != asdict(loaded.cfg):
             raise ValueError("Checkpoint Ghost configuration differs from this notebook; use the matching notebook version.")
         loaded.load_state_dict({k:v for k,v in payload["weights"].items()
             if not k.startswith(("manager.", "target_encoder."))}, strict=True)
@@ -3041,12 +2981,12 @@ def _(mo, plt, np):
 
     def tensor_panel(title, values, mask=None, probabilities=False, labels=None):
         data = np.asarray(values)
-        fig, ax = plt.subplots(figsize=(3.2, 2.0), layout="constrained")
+        fig, ax = plt.subplots(figsize=(6.0, 3.8), layout="constrained")
         if probabilities:
             ax.bar(labels or list(range(data.size)), data.ravel(), color="#4f83cc")
             ax.set_ylim(0, 1)
             for i, value in enumerate(data.ravel()):
-                ax.text(i, float(value)+.02, f"{value:.3f}", ha="center", fontsize=8)
+                ax.text(i, float(value)+.02, f"{value:.3f}", ha="center", fontsize=11)
         else:
             data = np.atleast_2d(data)
             if mask is not None:
@@ -3060,9 +3000,13 @@ def _(mo, plt, np):
             else:
                 ax.set_ylabel("Slot")
                 ax.set_yticks(range(data.shape[0]))
-        ax.set_title(title, fontsize=10)
+        ax.set_title(title, fontsize=12)
         plt.close(fig)
-        return mo.as_html(fig)
+        # Figure size alone is insufficient: flex layout can squeeze image-only
+        # nodes down to their caption width. Reserve a readable CSS width too.
+        return mo.as_html(fig).style({
+            "width": "600px", "min-width": "600px", "flex-shrink": "0",
+        })
     return WidgetDAG, tensor_panel
 
 
@@ -3073,7 +3017,7 @@ def _(testing_frame, testing_geometry, testing_cue, testing_report, tensor_panel
     _maze = np.zeros((_height, _width))
     _maze[1:_height-1, _width//2] = 1
     _maze[1, 1:_width-1] = 1
-    _fig, _ax = plt.subplots(figsize=(2.5, 2.5), layout="constrained")
+    _fig, _ax = plt.subplots(figsize=(4.0, 4.0), layout="constrained")
     _ax.imshow(_maze, cmap="Greys_r", vmin=0, vmax=1)
     _ax.plot(*_f["pose"], "ro")
     _dx, _dy = [(0,-1),(1,0),(0,1),(-1,0)][_f["direction"]]
@@ -3086,11 +3030,8 @@ def _(testing_frame, testing_geometry, testing_cue, testing_report, tensor_panel
         "Encoder latent": tensor_panel("Encoder latent z", _f["z"]),
         "Incoming bank": tensor_panel("Bank before prediction creation", _f["bank_before"], _f["managed_active"]),
         "Prediction context": mo.vstack([
-            tensor_panel("Fixed USE rule", _f["probs"], _f["managed_active"]),
             tensor_panel("Actor context: delta, residual, age, usage, error", _f["context"]),
             mo.ui.table([dict(slot=i, age=int(_f["ages_before"][i]),
-                decision=["WAIT", "USE", "DISCARD"][_f["management"][i]]
-                    if _f["managed_active"][i] else "inactive",
                 used=bool(_f["used"][i])) for i in range(len(_f["used"]))], selection=None)]),
         "Strategy memory": tensor_panel("Strategy latent (evaluation mean)", _f["strategy"]),
         "Actor": tensor_panel("Action probabilities", _f["actor"], probabilities=True,
@@ -3101,18 +3042,25 @@ def _(testing_frame, testing_geometry, testing_cue, testing_report, tensor_panel
                 horizon=int(_f["horizons"][i]), created_at=int(_f["ids"][i]))
                 for i in range(len(_f["active"]))], selection=None)]),
     }
+    # Unroll the recurrent edge by one timestep rather than introducing a cycle.
+    _nodes["Incoming bank · next timestep"] = tensor_panel(
+        "Updated predictions carried into t + 1", _f["predictions"], _f["active"])
     _edges = [("Maze / cue", "Encoder input"), ("Encoder input", "Encoder latent"),
         ("Encoder latent", "Prediction context"), ("Incoming bank", "Prediction context"),
         ("Encoder latent", "Strategy memory"), ("Prediction context", "Strategy memory"),
         ("Encoder latent", "Actor"), ("Strategy memory", "Actor"), ("Prediction context", "Actor"),
         ("Encoder latent", "Predictor / updated bank"), ("Strategy memory", "Predictor / updated bank"),
-        ("Actor", "Predictor / updated bank"), ("Incoming bank", "Predictor / updated bank")]
+        ("Actor", "Predictor / updated bank"), ("Incoming bank", "Predictor / updated bank"),
+        ("Predictor / updated bank", "Incoming bank · next timestep")]
     mo.vstack([
         mo.md(f"Episode: **{testing_report['steps']} steps** · success **{bool(testing_report['success'])}** · "
               f"selected action **{['left','right','forward'][_f['action']]}**. "
               "Gray bank rows are inactive. Memory and incoming predictions come from earlier timesteps; "
-              "the updated bank feeds the next decision."),
-        WidgetDAG(nodes=_nodes, edges=_edges),
+              "the updated bank feeds Incoming bank at the next timestep (before age-based expiration)."),
+        mo.as_html(WidgetDAG(nodes=_nodes, edges=_edges)).style({
+            "display": "block", "width": "100%", "max-width": "100%",
+            "min-width": "0", "overflow-x": "auto", "padding-bottom": "16px",
+        }),
     ])
     return
 
@@ -3127,7 +3075,7 @@ def _(mo):
 
 @app.cell
 def _(testing_frame,spike_module,plt):
-    _raster,_ax=plt.subplots(figsize=(12,2.5),layout="constrained")
+    _raster,_ax=plt.subplots(figsize=(14,4),layout="constrained")
     _ax.imshow(testing_frame["spike_rates"][spike_module.value],
         aspect="auto",cmap="binary",vmin=0,vmax=1)
     _ax.set(xlabel="Neuron",ylabel="World / slot",title="Mean spike rate over internal Ghost ticks")
